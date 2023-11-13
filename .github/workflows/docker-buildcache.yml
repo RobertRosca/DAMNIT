@@ -41,5 +41,5 @@ jobs:
           target: "build"
           tags: "build"
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-from: type=registry,ref=ghcr.io/robertrosca/damnit:buildcache
+          cache-to: type=registry,ref=ghcr.io/robertrosca/damnit:buildcache,mode=max
