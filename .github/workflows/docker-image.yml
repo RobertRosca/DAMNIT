@@ -42,6 +42,7 @@ jobs:
             type=pep440,pattern={{version}}  # version on tag
             type=edge  # 'edge' on push to default branch
             type=ref,event=branch  # ref on push to branch
+            type=ref,event=pr  # ref on pr
 
       - name: Build and push Docker image
         uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09  # v5.0.0
