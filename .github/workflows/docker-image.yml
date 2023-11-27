@@ -44,7 +44,6 @@ jobs:
           tags: |
             type=pep440,pattern={{version}}  # '{version}' on tag
             type=edge,branch=master  # 'edge' on push to master branch
-            type=ref,event=workflow_dispatch  # '{branch-name}' on manual trigger
             type=ref,event=pr  # 'pr-{pr-no}' on pr
 
       - name: Build and push Docker image
