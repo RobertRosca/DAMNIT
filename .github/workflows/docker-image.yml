@@ -43,7 +43,7 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
             type=pep440,pattern={{version}}  # version on tag
-            type=edge  # 'edge' on push to default branch
+            type=edge,branch=master  # 'edge' on push to default branch
             type=ref,event=branch  # ref on push to branch
             type=ref,event=pr  # ref on pr
 
