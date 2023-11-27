@@ -42,10 +42,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=pep440,pattern={{version}}  # version on tag
-            type=edge,branch=master  # 'edge' on push to default branch
-            type=ref,event=branch  # ref on push to branch
-            type=ref,event=pr  # ref on pr
+            type=pep440,pattern={{version}}  # '{version}' on tag
+            type=edge,branch=master  # 'edge' on push to master branch
+            type=ref,event=workflow_dispatch  # '{branch-name}' on manual trigger
+            type=ref,event=pr  # 'pr-{pr-no}' on pr
 
       - name: Build and push Docker image
         uses: docker/build-push-action@0565240e2d4ab88bba5387d719585280857ece09  # v5.0.0
@@ -53,4 +53,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=registry,ref=ghcr.io/robertrosca/damnit:buildcache
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
