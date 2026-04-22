@@ -1,28 +1,10 @@
-import time
-from enum import Enum
+import sys
 from datetime import datetime, timezone
 
+import numpy as np
 import pandas as pd
+from pandas.api.types import infer_dtype
 
-
-class StatusbarStylesheet(Enum):
-    NORMAL = "QStatusBar {}"
-    ERROR = "QStatusBar {background: red; color: white; font-weight: bold;}"
-
-def wait_until(condition, timeout=1):
-    """
-    Re-evaluate `condition()` until it either returns true or we've waited
-    longer than `timeout`.
-    """
-    slept_for = 0
-    sleep_interval = 0.2
-
-    while slept_for < timeout and not condition():
-        time.sleep(sleep_interval)
-        slept_for += sleep_interval
-
-    if slept_for >= timeout:
-        raise TimeoutError("Condition timed out")
 
 def timestamp2str(timestamp):
     if timestamp is None or pd.isna(timestamp):
@@ -31,3 +13,12 @@ def timestamp2str(timestamp):
     dt_utc = datetime.fromtimestamp(timestamp, timezone.utc)
     dt_local = dt_utc.astimezone()
     return dt_local.strftime("%H:%M:%S %d/%m/%Y")
+
+
+def isinstance_no_import(obj, mod: str, cls: str):
+    """Check if isinstance(obj, mod.cls) without loading mod"""
+    m = sys.modules.get(mod)
+    if m is None:
+        return False
+
+    return isinstance(obj, getattr(m, cls))

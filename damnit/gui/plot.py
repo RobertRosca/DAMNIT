@@ -1,109 +1,102 @@
 import logging
+import tempfile
+
+import matplotlib
+import mplcursors
 import numpy as np
 import pandas as pd
-import tempfile
-from pandas.api.types import is_numeric_dtype
+import xarray as xr
 
-from PyQt5.QtCore import Qt
-from PyQt5 import QtCore, QtWidgets, QtGui
+from matplotlib.backends.backend_qtagg import FigureCanvas
+from matplotlib.backends.backend_qtagg import \
+    NavigationToolbar2QT as NavigationToolbar
+from matplotlib.colorbar import Colorbar
+from matplotlib.figure import Figure
+from mpl_pan_zoom import MouseButton, PanManager, zoom_factory
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import Qt, QObject
+from PyQt5.QtGui import QColor, QIcon, QPainter
 from PyQt5.QtWidgets import QMessageBox
 
-import mplcursors
-from matplotlib.backends.backend_qtagg import (
-    FigureCanvas,
-    NavigationToolbar2QT as NavigationToolbar,
-)
-from matplotlib.figure import Figure
-from matplotlib import cm as mpl_cm
-from mpl_pan_zoom import zoom_factory, PanManager, MouseButton
-
-from .zulip_messenger import ZulipMessenger
+from ..api import RunVariables
+from .theme import Theme
 
 log = logging.getLogger(__name__)
 
-class Canvas(QtWidgets.QDialog):
+CORRELATION_MSG = """\
+Note: the variables being plotted are not strongly correlated.
+AMORE currently expects that all arrays are train-resolved; and when plotting  
+two arrays against each other that have train ID information, AMORE will use the  
+train IDs to properly correlate the values in the arrays. 
+
+
+If train ID information is not stored, then the arrays will be plotted directly  
+against each other. If your data is not train-resolved that's fine and you can  
+probably ignore this warning, otherwise make sure you use .xarray() to load data  
+in your context file with train IDs.
+"""
+
+class PlotWindow(QtWidgets.QDialog):
+    show_autoscale = False
+
     def __init__(
-        self,
-        parent=None,
-        x=[],
-        y=[],
-        image=None,
-        xlabel="",
-        ylabel="",
-        fmt="o",
-        legend=None,
-        plot_type="default",
-        strongly_correlated=False,
-        autoscale=True,
+            self, parent=None, xlabel="", ylabel="", title=None, summary_values=False
     ):
         super().__init__()
-        self.setStyleSheet("QDialog {background-color: white}")
-
+        self.setWindowFlags(
+            Qt.Window |
+            Qt.WindowMinimizeButtonHint |
+            Qt.WindowMaximizeButtonHint |
+            Qt.WindowCloseButtonHint
+        )
+        
         self.main_window = parent
+        self.layout = QtWidgets.QVBoxLayout(self)
 
-        self.data_x, self.data_y = None, None
-        self.histogram1D_bins = 5
+        # Get current theme from main window
+        self.current_theme = self.main_window.current_theme if self.main_window else Theme.LIGHT
 
-        layout = QtWidgets.QVBoxLayout(self)
-
-        self.plot_type = plot_type
-        is_histogram = self.plot_type != "default"
+        self.xlabel = xlabel
+        self.ylabel = ylabel
+        self.summary_values = summary_values
 
         self.figure = Figure(figsize=(8, 5))
         self._canvas = FigureCanvas(self.figure)
         self._axis = self._canvas.figure.subplots()
-        self._axis.set_xlabel(xlabel)
-        self._axis.set_ylabel(ylabel if not is_histogram else "Probability density")
-        self._axis.set_title(
-            f"{ylabel} vs. {xlabel}"
-            if not is_histogram
-            else f"Probability density of {xlabel}"
-        )
 
-        self._fmt = fmt
-        self._lines = {}
-        self._image = None
-        self._kwargs = {}
+        self._axis.set_xlabel(xlabel)
+        self._axis.set_ylabel(ylabel)
+        if title is not None:
+            self.setWindowTitle(title)
+            self._axis.set_title(title)
 
         self._navigation_toolbar = NavigationToolbar(self._canvas, self)
         self._navigation_toolbar.setIconSize(QtCore.QSize(20, 20))
         self._navigation_toolbar.layout().setSpacing(1)
 
-        layout.addWidget(self._canvas)
+        self.layout.addWidget(self._canvas)
 
-        if not strongly_correlated:
-            correlation_warning = "Note: the variables being plotted are not strongly correlated. " \
-                "AMORE currently expects that all arrays are train-resolved; and when plotting " \
-                "two arrays against each other that have train ID information, AMORE will use the " \
-                "train IDs to properly correlate the values in the arrays." \
-                "\n\n" \
-                "If train ID information is not stored, then the arrays will be plotted directly " \
-                "against each other. If your data is not train-resolved that's fine and you can " \
-                "probably ignore this warning, otherwise make sure you use .xarray() to load data " \
-                "in your context file with train IDs."
+        self._corr_warning_label = QtWidgets.QLabel(CORRELATION_MSG)
+        self._corr_warning_label.setWordWrap(True)
+        self._corr_warning_label.hide()
+        self.layout.addWidget(self._corr_warning_label)
 
-            warning_label = QtWidgets.QLabel(correlation_warning)
-            warning_label.setWordWrap(True)
-            layout.addWidget(warning_label)
-
-        self._nan_warning_label = QtWidgets.QLabel("Warning: at least one of the variables is all NaNs, " \
+        self._nan_warning_label = QtWidgets.QLabel("Warning: at least one of the variables is all NaNs, "
                                                    "it may not be plotted.")
         self._nan_warning_label.setWordWrap(True)
         self._nan_warning_label.hide()
-        layout.addWidget(self._nan_warning_label)
+        self.layout.addWidget(self._nan_warning_label)
 
-        self._autoscale_checkbox = QtWidgets.QCheckBox("Autoscale", self)
-        self._autoscale_checkbox.setCheckState(QtCore.Qt.CheckState.Checked)
-        self._autoscale_checkbox.setLayoutDirection(
-            QtCore.Qt.LayoutDirection.RightToLeft
-        )
-
-        self._dynamic_aspect_checkbox = QtWidgets.QCheckBox("Dynamic aspect ratio")
-        self._dynamic_aspect_checkbox.setCheckState(Qt.Unchecked)
-        self._dynamic_aspect_checkbox.setLayoutDirection(Qt.RightToLeft)
-        self._dynamic_aspect_checkbox.stateChanged.connect(
-            lambda state: self.set_dynamic_aspect(state == Qt.Checked)
-        )
+        if self.show_autoscale:
+            self._autoscale_checkbox = QtWidgets.QCheckBox("Autoscale", self)
+            self._autoscale_checkbox.setCheckState(QtCore.Qt.CheckState.Checked)
+            self._autoscale_checkbox.setLayoutDirection(
+                QtCore.Qt.LayoutDirection.RightToLeft
+            )
+            self.controls_row1 = QtWidgets.QHBoxLayout()
+            self.controls_row1.addStretch()
+            self.controls_row1.addWidget(self._autoscale_checkbox)
+            self.layout.addLayout(self.controls_row1)
 
         self._display_annotations_checkbox = QtWidgets.QCheckBox(
             "Display hover annotations", self
@@ -111,53 +104,41 @@ class Canvas(QtWidgets.QDialog):
         self._display_annotations_checkbox.stateChanged.connect(self.toggle_annotations)
         self._display_annotations_checkbox.setLayoutDirection(QtCore.Qt.RightToLeft)
 
-        if self.plot_type == "histogram1D":
-            self._probability_density_bins = QtWidgets.QSpinBox(self)
-            self._probability_density_bins.setMinimum(5)
-            self._probability_density_bins.setMaximum(100000)
-            self._probability_density_bins.setSingleStep(25)
-            self._probability_density_bins.setValue(self.histogram1D_bins)
-            self._probability_density_bins.valueChanged.connect(
-                self.probability_density_bins_changed
-            )
+        # controls_row2 also holds the bins spinner for HistogramPlotWindow
+        self.controls_row2 = QtWidgets.QHBoxLayout()
+        self.controls_row2.addStretch()
+        self.controls_row2.addWidget(self._display_annotations_checkbox)
+        self.layout.addLayout(self.controls_row2)
 
-        h1_layout = QtWidgets.QHBoxLayout()
-        h1_layout.addStretch()
-        h1_layout.addWidget(self._autoscale_checkbox)
-
-        h2_layout = QtWidgets.QHBoxLayout()
-        if self.plot_type == "histogram1D":
-            h2_layout.addWidget(QtWidgets.QLabel("Number of bins"))
-            h2_layout.addWidget(self._probability_density_bins)
-
-        h2_layout.addStretch()
-        h2_layout.addWidget(self._display_annotations_checkbox)
-
-        layout.addLayout(h1_layout)
-        layout.addLayout(h2_layout)
-        if image is not None:
-            layout.addWidget(self._dynamic_aspect_checkbox)
-
-        layout.addWidget(self._navigation_toolbar)
+        self.layout.addWidget(self._navigation_toolbar)
 
         self._cursors = []
-        self._zoom_factory = None
+        self._scroll_zoom = None
         self._panmanager = PanManager(self.figure, MouseButton.LEFT)
-
-        self.update_canvas(x, y, image, legend=legend)
-
-        # Take a guess at a good aspect ratio if it's an image
-        if image is not None:
-            aspect_ratio = max(image.shape[:2]) / min(image.shape[:2])
-            if aspect_ratio > 4:
-                self._dynamic_aspect_checkbox.setCheckState(Qt.Checked)
 
         self.figure.tight_layout()
 
+        # Apply theme to matplotlib figure
+        self._update_plot_theme()
+
+    _autoscale_checkbox = None
+
+    def _autoscale_enabled(self):
+        return self._autoscale_checkbox and self._autoscale_checkbox.isChecked()
+
+    def _make_cursors(self):
+        return []  # Overridden in subclasses
+
+    def _setup_scroll_zoom(self):
+        # This needs to be redone when plotting changes the axes limits, so it
+        # zooms on the correct position.
+        if self._scroll_zoom is not None:
+            self._scroll_zoom()  # Call to disconnect
+        self._scroll_zoom = zoom_factory(self._axis, base_scale=1.07)
+
     def toggle_annotations(self, state):
         if state == QtCore.Qt.Checked:
-            for line in self._lines.values():
-                self._cursors.append(mplcursors.cursor(line, hover=True))
+            self._cursors.extend(self._make_cursors())
         else:
             for cursor in self._cursors:
                 cursor.remove()
@@ -183,15 +164,15 @@ class Canvas(QtWidgets.QDialog):
         with open(file_name, 'rb') as fn:
             self.main_window.zulip_messenger.send_figure(img = fn)
 
-    @property
-    def has_data(self):
-        return len(self._lines) > 0
-
-    def probability_density_bins_changed(self):
-        self.histogram1D_bins = self._probability_density_bins.value()
-        self.update_canvas()
-
     def autoscale(self, x_min, x_max, y_min, y_max, margin=0.05):
+        # Always convert the inputs to floats in case they're booleans or
+        # something, which would otherwise fail later when subtracting the
+        # min/max values.
+        x_min = float(x_min)
+        x_max = float(x_max)
+        y_min = float(y_min)
+        y_max = float(y_max)
+
         if not np.any(np.isnan([x_min, x_max])):
             x_range = np.abs(x_max - x_min)
             x_min = x_min - x_range * margin
@@ -204,152 +185,265 @@ class Canvas(QtWidgets.QDialog):
             y_max = y_max + y_range * margin
             self._axis.set_ylim((y_min, y_max))
 
-    def set_dynamic_aspect(self, is_dynamic):
-        aspect = "auto" if is_dynamic else "equal"
-        self._axis.set_aspect(aspect)
-        self.figure.canvas.draw()
+    def update(self):
+        pass  # Overridden in subclasses
 
-    def update_canvas(self, xs=None, ys=None, image=None, legend=None, series_names=["default"]):
-        cmap = mpl_cm.get_cmap("tab20")
+    def _update_plot_toolbar_theme(self):
+        if self.current_theme == Theme.DARK:
+            enabled_color = QColor('white')
+            disabled_color = QColor('grey')
+        else:
+            enabled_color = QColor('black')
+            disabled_color = QColor('grey')
+
+        for action in self._navigation_toolbar.actions():
+            if action.icon() and not action.icon().isNull():
+                pixmap = action.icon().pixmap(24, 24)
+                painter = QPainter(pixmap)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                painter.fillRect(pixmap.rect(), enabled_color if action.isEnabled() else disabled_color)
+                painter.end()
+                action.setIcon(QIcon(pixmap))
+
+    def _update_plot_theme(self):
+        """Update matplotlib figure colors based on current theme."""
+        dark = self.current_theme == Theme.DARK
+
+        self.figure.patch.set_facecolor('#232323' if dark else 'white')
+        self._axis.set_facecolor('#232323' if dark else 'white')
+        self._axis.tick_params(colors='white' if dark else 'black')
+        self._axis.xaxis.label.set_color('white' if dark else 'black')
+        self._axis.yaxis.label.set_color('white' if dark else 'black')
+        self._axis.title.set_color('white' if dark else 'black')
+        for spine in self._axis.spines.values():
+            spine.set_color('white' if dark else 'black')
+
+        self._canvas.draw()
+
+    def update_theme(self, theme: Theme):
+        """Update the window theme."""
+        self.current_theme = theme
+        self._update_plot_theme()
+        self._update_plot_toolbar_theme()
+
+
+class HistogramPlotWindow(PlotWindow):
+    show_autoscale = True
+
+    def __init__(self, parent, data, *, xlabel='', title=None, legend=None, **kwargs):
+        if title is None:
+            title = f"Probability density of {xlabel}"
+        super().__init__(
+            parent, xlabel=xlabel, ylabel="Probability density", title=title, **kwargs
+        )
+
+        self._hist_objects = []
+        self._hist_kwargs = []
+
+        self.n_bins = 5
+        self._probability_density_bins = QtWidgets.QSpinBox(self)
+        self._probability_density_bins.setMinimum(5)
+        self._probability_density_bins.setMaximum(100000)
+        self._probability_density_bins.setSingleStep(25)
+        self._probability_density_bins.setValue(self.n_bins)
+        self._probability_density_bins.valueChanged.connect(
+            self.probability_density_bins_changed
+        )
+        self.controls_row2.addWidget(QtWidgets.QLabel("Number of bins"))
+        self.controls_row2.addWidget(self._probability_density_bins)
+
+        self.update_canvas(data, legend=legend)
+
+    def _clear_data(self):
+        for o in self._hist_objects:
+            o.remove()
+        self._hist_objects = []
+
+    def probability_density_bins_changed(self):
+        self.n_bins = self._probability_density_bins.value()
+
+        # Regenerate the histograms
+        self._clear_data()
         self._nan_warning_label.hide()
 
-        if (xs is None and ys is None) and self.plot_type == "histogram1D":
-            xs, ys = [], []
-
-            for series in self._lines.keys():
-                for i in range(len(self.data_x)):
-                    x, y = self.data_x[i], self.data_y[i]
-
-                    if self.plot_type == "default":
-                        self._lines[series][i].set_data(x, y)
-                    if self.plot_type == "histogram1D":
-                        # Don't try to update histograms of NaN arrays
-                        if np.all(np.isnan(x)):
-                            self._nan_warning_label.show()
-                            continue
-
-                        _ = [b.remove() for b in self._lines[series][i]]
-                        y, x, patches = self._axis.hist(
-                            x, bins=self.histogram1D_bins, **self._kwargs[series][i]
-                        )
-                        self._lines[series][i] = patches
-
-                    xs.append(x)
-                    ys.append(y)
-            self.figure.canvas.draw()
-
-            if self._autoscale_checkbox.isChecked() and len(xs) > 0:
-                xs_min, ys_min = xs[0].min(), 0
-                xs_max, ys_max = xs[0].max(), 1
-
-                for x, y in zip(xs, ys):
-                    xs_min = min(xs_min, x.min())
-                    xs_max = max(xs_max, x.max())
-                    ys_max = min(ys_max, y.max())
-
-                self.autoscale(xs_min, xs_max, 0, ys_max, margin=0.05)
-
-            return
-        elif image is not None:
-            if np.all(np.isnan(image)):
+        xs, ys = [], []
+        for i, data in enumerate(self.data_x):
+            # Don't try to update histograms of NaN arrays
+            if np.all(np.isnan(data)):
                 self._nan_warning_label.show()
+                continue
 
-            if self._image is None:
-                self._image = self._axis.imshow(image, interpolation="nearest")
-                self.figure.colorbar(self._image, ax=self._axis)
-            else:
-                self._image.set_array(image)
+            y, x, patches = self._axis.hist(
+                data, bins=self.n_bins, **self._hist_kwargs[i]
+            )
+            self._hist_objects.append(patches)
 
-            vmin = np.nanquantile(image, 0.01, interpolation='nearest')
-            vmax = np.nanquantile(image, 0.99, interpolation='nearest')
-            self._image.set_clim(vmin, vmax)
-        else:
-            self._axis.grid(visible=True)
-            self.data_x = xs
-            self.data_y = ys
+            xs.append(x)
+            ys.append(y)
+        self.figure.canvas.draw()
 
-            # Check for data that's all NaNs
-            for data in [*xs, *ys]:
-                if np.all(np.isnan(data)):
-                    self._nan_warning_label.show()
-                    break
+        if self._autoscale_enabled() and len(xs) > 0:
+            xs_min, ys_min = xs[0].min(), 0
+            xs_max, ys_max = xs[0].max(), 1
 
-            if len(xs):
-                xs_min, ys_min = np.asarray(xs[0]).min(), 0
-                xs_max, ys_max = np.asarray(xs[0]).max(), 1
+            for x, y in zip(xs, ys):
+                xs_min = min(xs_min, x.min())
+                xs_max = max(xs_max, x.max())
+                ys_max = min(ys_max, y.max())
 
-            self._lines[series_names[0]] = []
-            self._kwargs[series_names[0]] = []
-            for i, x, y, series, label in zip(
-                range(len(xs)),
-                xs,
-                ys,
-                len(xs) * series_names,
-                legend if legend is not None else len(xs) * [None],
-            ):
-                fmt = self._fmt if len(xs) == 1 else "o"
-                color = cmap(i / len(xs))
+            self.autoscale(xs_min, xs_max, 0, ys_max, margin=0.05)
 
-                plot_exists = len(self._lines[series_names[0]]) == len(xs)
-                if not plot_exists:
-                    if self.plot_type == "default":
-                        self._lines[series].append(
-                            self._axis.plot(
-                                [], [], fmt, color=color, label=label, alpha=0.5
-                            )[0]
-                        )
+        # Update the toolbar history so that clicking the home button resets the
+        # plot limits properly.
+        self._canvas.toolbar.update()
 
-                if self.plot_type == "default":
-                    self._lines[series][-1].set_data(x, y)
-                if self.plot_type == "histogram1D":
-                    self._kwargs[series].append(
-                        {
-                            "color": color,
-                            "density": True,
-                            "align": "mid",
-                            "label": label,
-                            "alpha": 0.5,
-                        }
-                    )
+    def _make_cursors(self):
+        return [mplcursors.cursor(self._hist_objects, hover=True)]
 
-                    # Don't try to histogram NaNs
-                    if np.all(np.isnan(x)):
-                        self._lines[series].append([])
-                        continue
+    def update(self):
+        if self.summary_values:
+            x = self.main_window.table.numbers_for_plotting(self.xlabel)
+            self.update_canvas([x])
 
-                    y, x, patches = self._axis.hist(
-                        x, bins=self.histogram1D_bins, **self._kwargs[series][-1]
-                    )
-                    self._lines[series].append(patches)
+    def update_canvas(self, xs, legend=None):
+        plot_exists = bool(self._hist_objects)
+        cmap = matplotlib.colormaps["tab20"]
+        self._nan_warning_label.hide()
+        self._clear_data()
 
-                    xs_min = min(xs_min, x.min())
-                    xs_max = max(xs_max, x.max())
-                    ys_max = min(ys_max, y.max())
+        self._axis.grid(visible=True)
+        self.data_x = xs
 
-                if len(xs) > 1:
-                    self._axis.legend()
-            self.figure.canvas.draw()
+        self._hist_kwargs = []
+        x_all, y_all = [], []
+        for i, data, label in zip(
+            range(len(xs)),
+            xs,
+            legend if legend is not None else len(xs) * [None],
+        ):
+            color = cmap(i / len(xs))
 
-            if len(xs):
-                if self._autoscale_checkbox.isChecked() or not plot_exists:
+            plot_exists = len(self._hist_objects) == len(xs)
 
-                    if self.plot_type != "histogram1D":
-                        xs_min = np.nanmin([xi.min() for xi in xs])
-                        ys_min = np.nanmin([yi.min() for yi in ys])
-                        xs_max = np.nanmax([xi.max() for xi in xs])
-                        ys_max = np.nanmax([yi.max() for yi in ys])
+            self._hist_kwargs.append({
+                "color": color,
+                "density": True,
+                "align": "mid",
+                "label": label,
+                "alpha": 0.5,
+            })
 
-                    self.autoscale(
-                        xs_min,
-                        xs_max,
-                        ys_min if not self.plot_type == "histogram1D" else 0,
-                        ys_max,
-                        margin=0.05,
-                    )
+            # Don't try to histogram NaNs
+            if np.all(np.isnan(data)):
+                self._nan_warning_label.show()
+                self._hist_objects.append([])
+                continue
 
-        if self._zoom_factory is not None:
-            self._zoom_factory()
-        self._zoom_factory = zoom_factory(self._axis, base_scale=1.07)
+            y, x, patches = self._axis.hist(
+                data, bins=self.n_bins, **self._hist_kwargs[-1]
+            )
+            self._hist_objects.append(patches)
+
+            x_all.append(x)
+            y_all.append(y)
+
+        if len(xs) > 1:
+            self._axis.legend()
+        self.figure.canvas.draw()
+
+        if sum(a.size for a in x_all) and (self._autoscale_enabled() or not plot_exists):
+            x_all = np.concatenate(x_all)
+            y_all = np.concatenate(y_all)
+            self.autoscale(
+                np.nanmin(x_all), np.nanmax(x_all), 0, np.nanmax(y_all), margin=0.05,
+            )
+
+        self._setup_scroll_zoom()
+
+        # Update the toolbar history so that clicking the home button resets the
+        # plot limits properly.
+        self._canvas.toolbar.update()
+
+
+class ScatterPlotWindow(PlotWindow):
+    def __init__(
+        self,
+        parent,
+        x,
+        y,
+        fmt="o",
+        legend=None,
+        strongly_correlated=True,
+        autoscale=False,
+        **kwargs
+    ):
+        self.show_autoscale = autoscale
+
+        super().__init__(parent, **kwargs)
+
+        self._fmt = fmt
+        self._lines = []
+
+        if not strongly_correlated:
+            self._corr_warning_label.show()
+
+        self.update_canvas(x, y, legend=legend)
+
+    def _make_cursors(self):
+        return [mplcursors.cursor(self._lines, hover=True)]
+
+    def update(self):
+        if self.summary_values:
+            x, y = self.main_window.table.numbers_for_plotting(
+                self.xlabel, self.ylabel
+            )
+            self.update_canvas([np.array(x)], [np.array(y)])
+
+    def update_canvas(self, xs=None, ys=None, legend=None):
+        cmap = matplotlib.colormaps["tab20"]
+        self._nan_warning_label.hide()
+
+        self._axis.grid(visible=True)
+        self.data_x = xs
+        self.data_y = ys
+
+        # Check for data that's all NaNs
+        for data in [*xs, *ys]:
+            if np.all(np.isnan(data)):
+                self._nan_warning_label.show()
+                break
+
+        plot_exists = len(self._lines) == len(xs)
+
+        self._lines = []
+        for i, x, y, label in zip(
+            range(len(xs)),
+            xs,
+            ys,
+            legend if legend is not None else len(xs) * [None],
+        ):
+            fmt = self._fmt if len(xs) == 1 else "o"
+            color = cmap(i / len(xs))
+
+            self._lines.append(
+                self._axis.plot(
+                    x, y, fmt, color=color, label=label, alpha=0.5
+                )[0]
+            )
+
+        if len(xs) > 1:
+            self._axis.legend()
+        self.figure.canvas.draw()
+
+        if len(xs) and (self._autoscale_enabled() or not plot_exists):
+            xs_min = np.nanmin([xi.min() for xi in xs])
+            ys_min = np.nanmin([yi.min() for yi in ys])
+            xs_max = np.nanmax([xi.max() for xi in xs])
+            ys_max = np.nanmax([yi.max() for yi in ys])
+
+            self.autoscale(xs_min, xs_max, ys_min, ys_max, margin=0.05)
+
+        self._setup_scroll_zoom()
 
         # Update the toolbar history so that clicking the home button resets the
         # plot limits properly.
@@ -364,6 +458,156 @@ class Canvas(QtWidgets.QDialog):
             # current data.
             self._display_annotations_checkbox.setCheckState(QtCore.Qt.Unchecked)
             self._display_annotations_checkbox.setCheckState(QtCore.Qt.Checked)
+
+class Xarray1DPlotWindow(PlotWindow):
+    def __init__(self, parent, data, **kwargs):
+        super().__init__(parent, **kwargs)
+
+        self.data = data
+        if np.all(np.isnan(data)):
+            self._nan_warning_label.show()
+
+        data.plot(ax=self._axis)
+        self._axis.grid()
+        self._setup_scroll_zoom()
+        # The plot call above can add axis labels, so we need to do this again
+        self.figure.tight_layout()
+
+
+class ImagePlotWindow(PlotWindow):
+    _image_artist = None
+    _colorbar = None
+    _data_source = None
+
+    def __init__(self, parent, image, **kwargs):
+        super().__init__(parent, **kwargs)
+        self._data_source = image
+
+        self._dynamic_aspect_checkbox = QtWidgets.QCheckBox("Dynamic aspect ratio")
+        self._dynamic_aspect_checkbox.setCheckState(Qt.Unchecked)
+        self._dynamic_aspect_checkbox.setLayoutDirection(Qt.RightToLeft)
+        self._dynamic_aspect_checkbox.stateChanged.connect(
+            lambda state: self.set_dynamic_aspect(state == Qt.Checked)
+        )
+
+        self._plot_as_lines_checkbox = QtWidgets.QCheckBox("Plot as lines")
+        self._plot_as_lines_checkbox.setCheckState(Qt.Unchecked)
+        self._plot_as_lines_checkbox.setLayoutDirection(Qt.RightToLeft)
+        self._plot_as_lines_checkbox.stateChanged.connect(self._on_plot_mode_changed)
+
+        before_mpl_nav = self.layout.indexOf(self._navigation_toolbar)
+        self.layout.insertWidget(before_mpl_nav, self._dynamic_aspect_checkbox)
+        self.layout.insertWidget(before_mpl_nav + 1, self._plot_as_lines_checkbox)
+
+        aspect_ratio = max(image.shape[:2]) / min(image.shape[:2])
+        if aspect_ratio > 4:
+            self._dynamic_aspect_checkbox.setCheckState(Qt.Checked)
+
+        self.update_canvas(self._data_source)
+
+    def _on_plot_mode_changed(self, state):
+        self.update_canvas()
+
+    def set_dynamic_aspect(self, is_dynamic):
+        if self._plot_as_lines_checkbox.isChecked():
+            aspect = "auto"
+        else:
+            aspect = "auto" if is_dynamic else "equal"
+        self._axis.set_aspect(aspect)
+        self.figure.canvas.draw_idle()
+
+    def _draw_lines(self, current_data):
+        """Draw data as 1D lines."""
+        self._dynamic_aspect_checkbox.setEnabled(False)
+        self._axis.set_aspect("auto")
+
+        if isinstance(current_data, xr.DataArray):
+            current_data.plot.line(
+                hue=current_data.dims[0],
+                ax=self._axis,
+                add_legend=current_data.shape[0] <= 10,
+            )
+        else:
+            # Numpy array
+            self._axis.set_xlabel("Index")
+            self._axis.set_ylabel("Value")
+            self._axis.set_title("Line plot")
+            for i, row in enumerate(current_data):
+                self._axis.plot(row, label=f"Line {i}")
+            if current_data.shape[0] <= 10:
+                self._axis.legend()
+
+        self.figure.tight_layout()
+
+    def _draw_image(self, image):
+        """Draw data as a 2D image."""
+        self._dynamic_aspect_checkbox.setEnabled(True)
+        self.set_dynamic_aspect(self._dynamic_aspect_checkbox.isChecked())
+
+        if isinstance(image, xr.DataArray):
+            if image.ndim == 2:
+                vmin = np.nanquantile(image, 0.01, method='nearest')
+                vmax = np.nanquantile(image, 0.99, method='nearest')
+                plot_result = image.plot.imshow(
+                    ax=self._axis, interpolation='antialiased', vmin=vmin, vmax=vmax,
+                    origin='lower', add_colorbar=True
+                )
+                if isinstance(plot_result, dict):
+                    self._image_artist = plot_result.get('artist')
+                    self._colorbar = plot_result.get('color_bar')
+                else:
+                    self._image_artist = plot_result
+                    self._colorbar = None
+            else:  # RGB(A) colour image
+                self._image_artist = image.plot.imshow(ax=self._axis, interpolation='antialiased')
+            self.figure.tight_layout()
+        else:
+            # Numpy array
+            is_color_image = image.ndim == 3
+            self._image_artist = self._axis.imshow(image, interpolation="antialiased")
+            if not is_color_image:
+                self._colorbar = self.figure.colorbar(self._image_artist, ax=self._axis)
+                vmin = np.nanquantile(image, 0.01, method='nearest')
+                vmax = np.nanquantile(image, 0.99, method='nearest')
+                self._image_artist.set_clim(vmin, vmax)
+            else:
+                self._axis.tick_params(left=False, bottom=False,
+                                       labelleft=False, labelbottom=False)
+                self._axis.set_xlabel("")
+                self._axis.set_ylabel("")
+
+    def update_canvas(self, data=None):
+        if data is not None:
+            self._data_source = data
+
+        if self._data_source is None:
+            return 
+
+        if self._colorbar is not None:
+            try:
+                self._colorbar.remove()
+            except Exception:
+                log.error("Error removing colorbar", exc_info=True)
+            self._colorbar = None
+
+        self.figure.clear()
+        self._axis = self.figure.add_subplot(111)
+        self._update_plot_theme()
+        self._image_artist = None
+
+        if np.all(np.isnan(self._data_source)):
+            self._nan_warning_label.show()
+        else:
+            self._nan_warning_label.hide()
+
+        if self._plot_as_lines_checkbox.isChecked() and self._data_source.ndim == 2:
+            self._draw_lines(self._data_source)
+        else:
+            self._draw_image(self._data_source)
+
+        self._setup_scroll_zoom()
+        self._canvas.toolbar.update()
+        self.figure.canvas.draw_idle()
 
 
 class SearchableComboBox(QtWidgets.QComboBox):
@@ -408,53 +652,70 @@ class SearchableComboBox(QtWidgets.QComboBox):
             super().focusInEvent(event)
 
 
-class Plot:
+class PlottingControls:
     def __init__(self, main_window) -> None:
         self._main_window = main_window
 
-        self.plot_type = "default"
+        self.dialog = QtWidgets.QDialog(main_window)
+        self.dialog.setWindowTitle("Plot Controls")
+        
+        plot_vertical_layout = QtWidgets.QVBoxLayout()
+        plot_horizontal_layout = QtWidgets.QHBoxLayout()
+        plot_parameters_horizontal_layout = QtWidgets.QHBoxLayout()
 
-        self._button_plot = QtWidgets.QPushButton(main_window)
+        self._button_plot = QtWidgets.QPushButton(self.dialog)
         self._button_plot.setEnabled(True)
         self._button_plot.setText("Plot summary for all runs")
-        self._button_plot.clicked.connect(lambda: self._button_plot_clicked(False))
+        self._button_plot.clicked.connect(self._plot_summaries_clicked)
 
-        self._button_plot_runs = QtWidgets.QPushButton(
-            "Plot for selected runs", main_window
-        )
-        self._button_plot_runs.clicked.connect(lambda: self._button_plot_clicked(True))
+        self._button_plot_runs = QtWidgets.QPushButton("Plot for selected runs", self.dialog)
+        self._button_plot_runs.clicked.connect(self._plot_run_data_clicked)
 
-        self._toggle_probability_density = QtWidgets.QPushButton(
-            "Histogram", main_window
-        )
-        self._toggle_probability_density.setCheckable(True)
-        self._toggle_probability_density.setChecked(True)
-        self._toggle_probability_density.toggle()
-        self._toggle_probability_density.clicked.connect(
-            self._toggle_probability_density_clicked
-        )
+        plot_horizontal_layout.addWidget(self._button_plot)
+        self._button_plot_runs.setMinimumWidth(200)
+        plot_horizontal_layout.addStretch()
 
-        self._combo_box_x_axis = SearchableComboBox(self._main_window)
-        self._combo_box_y_axis = SearchableComboBox(self._main_window)
+        self._combo_box_x_axis = SearchableComboBox(self.dialog)
+        self._combo_box_y_axis = SearchableComboBox(self.dialog)
 
         self.vs_button = QtWidgets.QToolButton()
         self.vs_button.setText("vs.")
         self.vs_button.setToolTip("Click to swap axes")
         self.vs_button.clicked.connect(self.swap_plot_axes)
 
+        plot_horizontal_layout.addWidget(QtWidgets.QLabel("Y:"))
+        plot_horizontal_layout.addWidget(self._combo_box_y_axis)
+        plot_horizontal_layout.addWidget(self.vs_button)
+        plot_horizontal_layout.addWidget(QtWidgets.QLabel("X:"))
+        plot_horizontal_layout.addWidget(self._combo_box_x_axis)
+
         self._combo_box_x_axis.setCurrentText("Run")
 
-        self._canvas = {
-            "key.x": [],
-            "key.y": [],
-            "canvas": [],
-            "type": [],
-            "legend": [],
-            "runs_as_series": [],
-        }
+        plot_vertical_layout.addLayout(plot_horizontal_layout)
+
+        plot_parameters_horizontal_layout.addWidget(self._button_plot_runs)
+        self._button_plot.setMinimumWidth(200)
+        plot_parameters_horizontal_layout.addStretch()
+
+        self._toggle_probability_density = QtWidgets.QPushButton("Histogram", self.dialog)
+        self._toggle_probability_density.setCheckable(True)
+        self._toggle_probability_density.setChecked(False)
+        self._toggle_probability_density.toggled.connect(self._combo_box_y_axis.setDisabled)
+
+        plot_parameters_horizontal_layout.addWidget(self._toggle_probability_density)
+
+        plot_vertical_layout.addLayout(plot_parameters_horizontal_layout)
+        
+        self.dialog.setLayout(plot_vertical_layout)
+        self.dialog.setVisible(False)
+
+        self._plot_windows = []
+
+    def show_dialog(self):
+        self.dialog.setVisible(True)
 
     def update_columns(self):
-        keys = list(self._main_window.data.columns)
+        keys = self.table.column_titles
 
         current_x = self._combo_box_x_axis.currentText()
         current_y = self._combo_box_y_axis.currentText()
@@ -481,47 +742,26 @@ class Plot:
         self._combo_box_x_axis.setCurrentText(new_x)
 
     @property
-    def _data(self):
-        return self._main_window.data
+    def table(self):
+        return self._main_window.table
 
-    def _button_plot_clicked(self, runs_as_series):
-        selected_rows = self._main_window.table_view.selectionModel().selectedRows()
-        xlabel = self._combo_box_x_axis.currentText()
-        ylabel = self._combo_box_y_axis.currentText()
+    def _plot_run_data_clicked(self):
+        selected_rows = self._main_window.table_view.selected_rows()
+        log.debug("Selected rows %r", [ix.row() for ix in selected_rows])
 
-        # Don't try to plot columns with non-numeric types, which might include
-        # e.g. images or strings. Note that the run and proposal columns are
-        # special cases, since we definitely might want to plot against those
-        # columns but they may have pd.NA's from comment rows (which are only
-        # given a timestamp).
-        safe_cols = ["Proposal", "Run"]
-        for label in [xlabel, ylabel]:
-            finite_data = self._main_window.fix_data_for_plotting(self._data[label])
-            if not label in safe_cols and not is_numeric_dtype(finite_data.dtype):
-                QMessageBox.warning(self._main_window,
-                                    "Plotting failed",
-                                    f"'{label}' could not be plotted, its column has non-numeric data.")
-                return
-
-        # multiple rows can be selected
-        # we could even merge multiple runs here
-        for index in selected_rows:
-            log.info("Selected row %d", index.row())
-
-        if runs_as_series:
-            if len(selected_rows) == 0:
-                QMessageBox.warning(
-                    self._main_window,
-                    "No runs selected",
-                    "When plotting runs as series, you must select some runs in the table.",
-                )
-                return
+        if len(selected_rows) == 0:
+            QMessageBox.warning(
+                self._main_window,
+                "No runs selected",
+                "When plotting runs as series, you must select some runs in the table.",
+            )
+            return
 
         # Find the proposals of currently selected runs
-        proposals = [self._data.iloc[index.row()]["Proposal"] for index in selected_rows]
-        proposals = [pi for pi in proposals if pi is not pd.NA]
+        props_runs = [self.table.row_to_proposal_run(ix.row()) for ix in selected_rows]
+        proposals = {p for (p, r) in props_runs if p is not pd.NA}
 
-        if len(set(proposals)) > 1:
+        if len(proposals) > 1:
             QMessageBox.warning(
                 self._main_window,
                 "Multiple proposals selected",
@@ -529,27 +769,29 @@ class Plot:
             )
             return
 
-        if self.plot_type == "histogram1D":
-            ylabel = xlabel
-
-        selected_runs = [self._data.iloc[index.row()]["Run"] for index in selected_rows]
+        xlabel = self._combo_box_x_axis.currentText()
+        if histogram := self._toggle_probability_density.isChecked():
+            ylabel = None
+        else:
+            ylabel = self._combo_box_y_axis.currentText()
 
         runs = []
         xs, ys = [], []
         strongly_correlated = True
-        if runs_as_series:
-            for p, r in zip(proposals, selected_runs):
-                try:
-                    correlated, xi, yi = self.get_run_series_data(p, r, xlabel, ylabel)
-                    strongly_correlated = strongly_correlated and correlated
-                except Exception:
-                    pass
-                else:
-                    runs.append(r)
-                    xs.append(xi)
-                    ys.append(yi)
 
-        if runs_as_series and (len(xs) == 0 or len(ys) == 0):
+        for p, r in props_runs:
+            try:
+                correlated, xi, yi = self.get_run_series_data(p, r, xlabel, ylabel)
+                strongly_correlated = strongly_correlated and correlated
+            except Exception:
+                log.warning(f"Couldn't retrieve data for run {r} ({xlabel}, {ylabel})",
+                            exc_info=True)
+            else:
+                runs.append(r)
+                xs.append(xi)
+                ys.append(yi)
+
+        if len(xs) == 0 or len(ys) == 0:
             log.warning("Error getting data for plot", exc_info=True)
             QMessageBox.warning(
                 self._main_window,
@@ -558,114 +800,116 @@ class Plot:
             )
             return
 
-        if runs_as_series:
+        if histogram:
+            log.info("New histogram for %r", xlabel)
+            canvas = HistogramPlotWindow(
+                self._main_window,
+                data=xs,
+                xlabel=xlabel,
+                legend=runs,
+            )
+        else:
             # Check that each X/Y pair has the same length
             for run, x, y in zip(runs, xs, ys):
                 if len(x) != len(y):
-                    QMessageBox.warning(self._main_window,
-                                        "X and Y have different lengths",
-                                        f"'{xlabel}' and '{ylabel}' have different lengths for run {run}, they " \
-                                        "must be the same to be plotted.\n\n" \
-                                        f"'{xlabel}' has length {len(x)} and '{ylabel}' has length {len(y)}.")
+                    QMessageBox.warning(
+                        self._main_window,
+                        "X and Y have different lengths",
+                        f"'{xlabel}' and '{ylabel}' have different lengths for run {run}, they "
+                        "must be the same to be plotted.\n\n"
+                        f"'{xlabel}' has length {len(x)} and '{ylabel}' has length {len(y)}."
+                    )
                     return
 
-        log.info("New plot for x=%r, y=%r", xlabel, ylabel)
-        canvas = Canvas(
-            self._main_window,
-            x=xs,
-            y=ys,
-            xlabel=xlabel,
-            ylabel=ylabel,
-            legend=runs,
-            plot_type=self.plot_type,
-            strongly_correlated=strongly_correlated
-        )
-        if runs_as_series:
-            canvas.setWindowTitle(f"Runs: {runs}")
+            log.info("New plot for x=%r, y=%r", xlabel, ylabel)
+            canvas = ScatterPlotWindow(
+                self._main_window,
+                x=xs,
+                y=ys,
+                xlabel=xlabel,
+                ylabel=ylabel,
+                legend=runs,
+                strongly_correlated=strongly_correlated,
+            )
+        canvas.setWindowTitle(f"Runs: {runs}")
 
-        self._canvas["key.x"].append(xlabel)
-        self._canvas["key.y"].append(ylabel)
-        self._canvas["canvas"].append(canvas)
-        self._canvas["type"].append(self.plot_type)
-        self._canvas["runs_as_series"].append(selected_rows if runs_as_series else None)
-
-        self.update()
+        self._plot_windows.append(canvas)
 
         canvas.show()
 
-    def _toggle_probability_density_clicked(self):
+    def _plot_summaries_clicked(self):
+        xlabel = self._combo_box_x_axis.currentText()
+
         if self._toggle_probability_density.isChecked():
-            self._combo_box_y_axis.setEnabled(False)
-            self.plot_type = "histogram1D"
+            log.info("New histogram for %r", xlabel)
+
+            vals = self.table.numbers_for_plotting(xlabel)[0]
+            if not vals:
+                QMessageBox.warning(
+                    self._main_window,
+                    "Plotting failed",
+                    f"No numeric data found in {xlabel}."
+                )
+                return
+
+            canvas = HistogramPlotWindow(
+                self._main_window,
+                data=[vals],
+                xlabel=xlabel,
+                summary_values=True,
+            )
         else:
-            self._combo_box_y_axis.setEnabled(True)
-            self.plot_type = "default"
+            ylabel = self._combo_box_y_axis.currentText()
+            log.info("New plot for x=%r, y=%r", xlabel, ylabel)
+
+            xvals, yvals = self.table.numbers_for_plotting(xlabel, ylabel)
+            if not xvals:
+                QMessageBox.warning(
+                    self._main_window,
+                    "Plotting failed",
+                    f"No numeric data found in {xlabel} & {ylabel}."
+                )
+                return
+
+            canvas = ScatterPlotWindow(
+                self._main_window,
+                x=[np.array(xvals)],
+                y=[np.array(yvals)],
+                xlabel=xlabel,
+                ylabel=ylabel,
+                autoscale=True,
+                summary_values=True,
+            )
+        self._plot_windows.append(canvas)
+
+        canvas.show()
 
     def update(self):
-        for index, (xi, yi, ci, runs_as_series) in enumerate(
-            zip(
-                self._canvas["key.x"].copy(),
-                self._canvas["key.y"].copy(),
-                self._canvas["canvas"].copy(),
-                self._canvas["runs_as_series"].copy(),
-            )
-        ):
-            xs = []
-            ys = []
+        for plot_window in self._plot_windows:
+            plot_window.update()
 
-            if runs_as_series:
-                # Plots with runs as series don't need to be updated (unless the
-                # variables have been changed by re-running the backend on a
-                # modified context file, but luckily this hasn't been
-                # implemented yet).
-                if ci.has_data:
-                    continue
-
-                # Find the proposals of currently selected runs
-                proposal = [index.siblingAtColumn(1).data() for index in runs_as_series]
-                run = [index.siblingAtColumn(2).data() for index in runs_as_series]
-
-                for pi, ri in zip(proposal, run):
-                    strongly_correlated, x, y = self.get_run_series_data(pi, ri, xi, yi)
-                    xs.append(self._main_window.fix_data_for_plotting(x))
-                    ys.append(self._main_window.fix_data_for_plotting(y))
-            else:
-                # not nice to replace NAs/infs with nans, but better solutions require more coding
-                xs.append(
-                    self._main_window.fix_data_for_plotting(self._data[xi])[self._data["Status"]]
-                )
-                ys.append(
-                    self._main_window.fix_data_for_plotting(self._data[yi])[self._data["Status"]]
-                )
-
-            log.debug("Updating plot for x=%s, y=%s", xi, yi)
-            ci.update_canvas(xs, ys)
-
-    def get_run_series_data(self, proposal, run, xlabel, ylabel):
-        file_name, dataset = self._main_window.get_run_file(proposal, run)
+    def get_run_series_data(self, proposal, run, xlabel, ylabel=None):
+        variables = RunVariables(self._main_window._context_path.parent, run)
+        # file_name, dataset = self._main_window.get_run_file(proposal, run)
 
         x_quantity = self._main_window.col_title_to_name(xlabel)
+        x_variable = variables[x_quantity]
+        x = x_variable.read()
+
+        if ylabel is None:
+            # Get 1 column for histogram
+            return True, x, None
+
         y_quantity = self._main_window.col_title_to_name(ylabel)
+        y_variable = variables[y_quantity]
+        y = y_variable.read()
 
         strongly_correlated = False
-        try:
-            x_ds, y_ds = dataset[x_quantity], dataset[y_quantity]
-
-            # If these variables are train-resolved, correlate by train ID
-            if "trainId" in x_ds and "trainId" in y_ds:
-                x_tids, y_tids = x_ds["trainId"][:], y_ds["trainId"][:]
-                tids, x_idxs, y_idxs = np.intersect1d(x_tids, y_tids, return_indices=True)
-
-                x = x_ds["data"][x_idxs]
-                y = y_ds["data"][y_idxs]
-                strongly_correlated = True
-            else:
-                x = x_ds["data"][:]
-                y = y_ds["data"][:]
-        except KeyError as e:
-            log.warning(f"{xlabel} or {ylabel} could not be found in {file_name}")
-            raise e
-        finally:
-            dataset.close()
+        if isinstance(x, xr.DataArray) and "trainId" in x.coords and \
+           isinstance(y, xr.DataArray) and "trainId" in y.coords:
+            tids = np.intersect1d(x.trainId, y.trainId)
+            x = x.sel(trainId=tids)
+            y = y.sel(trainId=tids)
+            strongly_correlated = True
 
         return strongly_correlated, x, y

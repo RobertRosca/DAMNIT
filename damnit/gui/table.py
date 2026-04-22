@@ -1,42 +1,581 @@
-from functools import lru_cache
+import hashlib
+import json
+import logging
+import time
+from base64 import b64encode
+from itertools import groupby
 
 import numpy as np
-import pandas as pd
+from fonticon_fa6 import FA6S
+from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import QProcess, Qt
+from PyQt5.QtGui import QCursor
+from PyQt5.QtWidgets import QAction, QMenu, QMessageBox
+from superqt.fonticon import icon
+from superqt.utils import qthrottled
 
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_qtagg import FigureCanvas
+from ..backend.db import BlobTypes, DamnitDB, ReducedData, blob2complex, blob2numpy
+from ..backend.extraction_control import ExtractionJobTracker
+from ..backend.user_variables import value_types_by_name
+from ..util import timestamp2str
+from .roles import LINE_DATA_ROLE, PROVENANCE_ROLE
+from .table_filter import FilterMenu, FilterProxy, FilterStatus
+from .util import delete_variable, StatusbarStylesheet
 
-from PyQt5 import QtCore, QtWidgets, QtGui
-from PyQt5.QtCore import Qt
-
-from ..util import StatusbarStylesheet, timestamp2str
+log = logging.getLogger(__name__)
 
 ROW_HEIGHT = 30
-THUMBNAIL_SIZE = 35
-# The actual threshold for long messages is around 6200
-# not 10k, otherwise one gets a '414 URI Too Long' error
+THUMBNAIL_SIZE = (100, 35)  # w, h (pixels)
+STATIC_COLUMNS = ["Status", "Proposal", "Run", "Timestamp", "Comment"]
+
+
+class FilterHeaderView(QtWidgets.QHeaderView):
+    def __init__(self, parent=None):
+        super().__init__(Qt.Horizontal, parent)
+        self.filtered_columns = set()
+        self.filter_icon = icon(FA6S.filter)
+        # Cache split titles per section so we only parse once per repaint
+        self._levels_by_section = {}
+        self._max_levels = 1
+        self._bound_model = None
+        self._hierarchy_enabled = True
+        base_size = super().sizeHint().height()
+        self._base_section_height = base_size if base_size > 0 else ROW_HEIGHT
+
+    def setModel(self, model):
+        if self._bound_model is not None:
+            self._bound_model.headerDataChanged.disconnect(self._handle_header_change)
+            self._bound_model.columnsInserted.disconnect(self._handle_model_change)
+            self._bound_model.columnsRemoved.disconnect(self._handle_model_change)
+            self._bound_model.modelReset.disconnect(self._handle_model_change)
+
+        super().setModel(model)
+        self._bound_model = model
+
+        if model is not None:
+            model.headerDataChanged.connect(self._handle_header_change)
+            model.columnsInserted.connect(self._handle_model_change)
+            model.columnsRemoved.connect(self._handle_model_change)
+            model.modelReset.connect(self._handle_model_change)
+
+        self._rebuild_hierarchy()
+
+    def sizeHint(self):
+        size = super().sizeHint()
+        base = self._base_section_height or size.height()
+        levels = self._max_levels if self._hierarchy_enabled else 1
+        size.setHeight(base * max(1, levels))
+        return size
+
+    def _draw_filter_hint(self, painter, rect):
+        icon_size = 16
+        padding = 4
+        icon_rect = QtCore.QRect(
+            rect.left() + rect.width() - icon_size - padding,
+            rect.top() + rect.height() - icon_size - padding,
+            icon_size,
+            icon_size,
+        )
+        painter.save()
+        painter.drawPixmap(icon_rect, self.filter_icon.pixmap(icon_size))
+        painter.restore()
+
+    def paintSection(self, painter, rect, logicalIndex):
+        if not rect.isValid():
+            return
+
+        if not self._hierarchy_enabled:
+            painter.save()
+            super().paintSection(painter, rect, logicalIndex)
+            painter.restore()
+            if logicalIndex in self.filtered_columns:
+                self._draw_filter_hint(painter, rect)
+            return
+
+        painter.save()
+
+        # paint the section, keeping styles/themes intact
+        option = QtWidgets.QStyleOptionHeader()
+        self.initStyleOption(option)
+        option.rect = rect
+        option.text = ""
+        option.section = logicalIndex
+
+        self.style().drawControl(QtWidgets.QStyle.CE_HeaderSection, option, painter, self)
+
+        if logicalIndex in self.filtered_columns:
+            self._draw_filter_hint(painter, rect)
+
+        painter.restore()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+
+        if not self._hierarchy_enabled:
+            return
+
+        if not self._levels_by_section and self.model() is not None:
+            self._rebuild_hierarchy()
+
+        # Second pass overlays the text so parent bands can span multiple columns
+        painter = QtGui.QPainter(self.viewport())
+        painter.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+        painter.setPen(self.palette().color(QtGui.QPalette.ButtonText))
+
+        header_rect = self.viewport().rect()
+        row_tops, row_heights = self._row_positions(header_rect)
+
+        for logical_index in range(self.count()):
+            if self.isSectionHidden(logical_index):
+                continue
+
+            levels = self._levels_by_section.get(logical_index)
+            if levels is None:
+                title = self.model().headerData(logical_index, Qt.Horizontal, Qt.DisplayRole)
+                levels = self._split_title(title)
+                self._levels_by_section[logical_index] = levels
+            for level_idx, text in enumerate(levels):
+                if not text:
+                    continue
+
+                span_rows = self._row_span(levels, level_idx)
+                top = row_tops[level_idx]
+                height = sum(row_heights[level_idx: level_idx + span_rows])
+                if height <= 0:
+                    continue
+
+                span_columns = self._group_span_columns(logical_index, level_idx)
+                is_group = span_columns > 1
+                if is_group and not self._is_group_lead(logical_index, level_idx):
+                    continue
+
+                if is_group:
+                    left, width = self._group_geometry(logical_index, level_idx)
+                else:
+                    left = self.sectionViewportPosition(logical_index)
+                    width = self.sectionSize(logical_index)
+
+                group_rect = QtCore.QRect(left, top, width, height)
+                visible_rect = group_rect.intersected(header_rect)
+                if not visible_rect.isValid() or visible_rect.width() <= 0:
+                    continue
+
+                if is_group:
+                    self._paint_group_background(painter, visible_rect)
+
+                text_rect = visible_rect.adjusted(4, 0, -4, 0)
+                if text_rect.width() <= 0:
+                    continue
+
+                painter.drawText(text_rect, Qt.AlignVCenter | Qt.AlignHCenter | Qt.TextWordWrap, text)
+
+    def update_filtered_columns(self, filtered_cols):
+        """Update the set of filtered columns and trigger repaint"""
+        self.filtered_columns = set(filtered_cols)
+        self.viewport().update()
+
+    def _handle_header_change(self, orientation, _first, _last):
+        if orientation == Qt.Horizontal:
+            self._rebuild_hierarchy()
+
+    def _handle_model_change(self, *args, **kwargs):
+        self._rebuild_hierarchy()
+
+    def _rebuild_hierarchy(self):
+        model = self.model()
+        self._levels_by_section = {}
+        max_levels = 1
+        if model is None:
+            self._max_levels = 1
+            self.viewport().update()
+            self.updateGeometry()
+            return
+
+        section_count = self.count()
+        for index in range(section_count):
+            title = model.headerData(index, Qt.Horizontal, Qt.DisplayRole)
+            levels = self._split_title(title)
+            self._levels_by_section[index] = levels
+            max_levels = max(max_levels, len(levels))
+
+        self._max_levels = max(1, max_levels)
+        self.updateGeometry()
+        self.viewport().update()
+
+    def _split_title(self, title):
+        if title is None:
+            return [""]
+        title_str = str(title)
+        parts = [part.strip() for part in title_str.split('/') if part.strip()]
+        return parts or [title_str]
+
+    def _row_positions(self, rect):
+        levels = max(1, self._max_levels)
+        total_height = max(1, rect.height())
+        base = total_height // levels
+        extra = total_height % levels
+        heights = []
+        for idx in range(levels):
+            heights.append(base + (1 if idx < extra else 0))
+        tops = []
+        running = rect.top()
+        for height in heights:
+            tops.append(running)
+            running += height
+        return tops, heights
+
+    def _row_span(self, levels, level_idx):
+        if level_idx >= len(levels):
+            return 0
+        if level_idx == len(levels) - 1:
+            return max(1, self._max_levels - level_idx)
+        return 1
+
+    def _is_group_lead(self, logical_index, level_idx):
+        prefix = self._prefix(logical_index, level_idx)
+        if prefix is None:
+            return False
+
+        visual = self.visualIndex(logical_index)
+        if visual <= 0:
+            return True
+
+        for vi in range(visual - 1, -1, -1):
+            prev_logical = self.logicalIndex(vi)
+            if prev_logical < 0 or self.isSectionHidden(prev_logical):
+                continue
+            return self._prefix(prev_logical, level_idx) != prefix
+        return True
+
+    def _prefix(self, logical_index, level_idx):
+        levels = self._levels_by_section.get(logical_index)
+        if not levels or level_idx >= len(levels):
+            return None
+        return tuple(levels[: level_idx + 1])
+
+    def _group_geometry(self, logical_index, level_idx):
+        if self.isSectionHidden(logical_index):
+            return 0, 0
+
+        prefix = self._prefix(logical_index, level_idx)
+        if prefix is None:
+            return 0, 0
+
+        # Start drawing from the visual leader so the merged rect covers all siblings
+        lead_index = self._group_lead_index(logical_index, level_idx)
+        start = self.sectionViewportPosition(lead_index)
+        if start < 0:
+            return 0, 0
+
+        width = 0
+        visual = self.visualIndex(lead_index)
+        count = self.count()
+        for vi in range(visual, count):
+            next_logical = self.logicalIndex(vi)
+            if next_logical < 0 or self.isSectionHidden(next_logical):
+                continue
+            if self._prefix(next_logical, level_idx) != prefix:
+                break
+            width += self.sectionSize(next_logical)
+
+        return start, width
+
+    def _group_span_columns(self, logical_index, level_idx):
+        if self.isSectionHidden(logical_index):
+            return 0
+
+        prefix = self._prefix(logical_index, level_idx)
+        if prefix is None:
+            return 1
+
+        lead_index = self._group_lead_index(logical_index, level_idx)
+        visual = self.visualIndex(lead_index)
+        if visual < 0:
+            return 1
+
+        span = 0
+        count = self.count()
+        for vi in range(visual, count):
+            next_logical = self.logicalIndex(vi)
+            if next_logical < 0 or self.isSectionHidden(next_logical):
+                continue
+            if self._prefix(next_logical, level_idx) != prefix:
+                break
+            span += 1
+
+        return max(1, span)
+
+    def _group_lead_index(self, logical_index, level_idx):
+        if self.isSectionHidden(logical_index):
+            return logical_index
+
+        prefix = self._prefix(logical_index, level_idx)
+        if prefix is None:
+            return logical_index
+
+        visual = self.visualIndex(logical_index)
+        if visual < 0:
+            return logical_index
+
+        lead = logical_index
+        for vi in range(visual - 1, -1, -1):
+            prev_logical = self.logicalIndex(vi)
+            if prev_logical < 0 or self.isSectionHidden(prev_logical):
+                continue
+            if self._prefix(prev_logical, level_idx) != prefix:
+                break
+            lead = prev_logical
+        return lead
+
+    def _paint_group_background(self, painter, rect):
+        # Ask the style engine for a header section so merged cells keep theme gradients/borders
+        option = QtWidgets.QStyleOptionHeader()
+        self.initStyleOption(option)
+        option.rect = rect
+        option.text = ""
+        option.state |= QtWidgets.QStyle.State_Raised
+        option.state &= ~(QtWidgets.QStyle.State_Sunken | QtWidgets.QStyle.State_On)
+        self.style().drawControl(QtWidgets.QStyle.CE_HeaderSection, option, painter, self)
+
+    def set_hierarchical_enabled(self, enabled: bool):
+        if self._hierarchy_enabled == enabled:
+            return
+        self._hierarchy_enabled = enabled
+        if enabled:
+            self._rebuild_hierarchy()
+        else:
+            self._levels_by_section.clear()
+            self._max_levels = 1
+
+        parent = self.parent()
+        if parent is not None:
+            if hasattr(parent, "updateGeometries"):
+                parent.updateGeometries()
+            parent.viewport().update()
+
+
+class ItemRendererDelegate(QtWidgets.QStyledItemDelegate):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        # Pre-compute equaly spaced color hues for provenance indicator
+        self.n_colors = 16
+        self.hues = [i / self.n_colors for i in range(self.n_colors)]
+        self.label_colors = {}
+
+    def _provenance_color(self, provenance: str) -> QtGui.QColor:
+        if provenance not in self.label_colors:
+            digest = hashlib.sha256(provenance.encode()).digest()
+            index = int.from_bytes(digest[:4], "big") % self.n_colors
+            hue = self.hues[index]
+            color = QtGui.QColor.fromHsl(int(255 * hue), 170, 200, 220)
+            self.label_colors[provenance] = color
+        return self.label_colors[provenance]
+
+    def _paint_provenance_marker(self, painter, option, index):
+        provenance = index.data(PROVENANCE_ROLE)
+        if not provenance:
+            return
+        rect = option.rect
+        color = self._provenance_color(provenance)
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        # draw corner triangle
+        x = rect.right()
+        y = rect.top() + 1
+        painter.setBrush(color)
+        painter.setPen(QtGui.QPen(color.darker(130)))
+        tri = QtGui.QPolygonF([
+            QtCore.QPointF(x, y),
+            QtCore.QPointF(x - 10, y),
+            QtCore.QPointF(x, y + 10),
+        ])
+        painter.drawPolygon(tri)
+        painter.restore()
+
+    def _paint_sparkline(self, data, painter, option, index):
+        # Base item rendering (selection background, etc.)
+        opt = QtWidgets.QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+
+        style = opt.widget.style() if opt.widget else QtWidgets.QApplication.style()
+        style.drawControl(QtWidgets.QStyle.CE_ItemViewItem, opt, painter, opt.widget)
+
+        # Pixel bounds for the sparkline drawing area.
+        rect = opt.rect.adjusted(2, 2, -2, -2)
+        if rect.width() < 4 or rect.height() < 4:
+            return
+
+        # Validate/prepare data.
+        if data.ndim != 2 or data.shape[0] != 2 or data.shape[1] < 2:
+            return
+
+        x = np.asarray(data[0], dtype=np.float64)
+        y = np.asarray(data[1], dtype=np.float64)
+
+        finite = np.isfinite(x) & np.isfinite(y)
+        if not finite.any():
+            return
+        x = x[finite]
+        y = y[finite]
+        if x.size < 2:
+            return
+
+        # Normalize data to [0,1] and map to pixel coordinates.
+        x_min = float(np.nanmin(x))
+        x_max = float(np.nanmax(x))
+        y_min = float(np.nanmin(y))
+        y_max = float(np.nanmax(y))
+
+        span_x = x_max - x_min
+        span_y = y_max - y_min
+
+        if span_x == 0:
+            x_norm = np.linspace(0, 1, x.size)
+        else:
+            x_norm = (x - x_min) / span_x
+
+        if span_y == 0:
+            y_norm = np.full_like(y, 0.5)
+        else:
+            y_norm = (y - y_min) / span_y
+
+        x_pix = rect.left() + x_norm * (rect.width() - 1)
+        y_pix = rect.top() + (1 - y_norm) * (rect.height() - 1)
+
+        # Build the polyline path.
+        poly = QtGui.QPolygonF()
+        for xi, yi in zip(x_pix, y_pix):
+            poly.append(QtCore.QPointF(float(xi), float(yi)))
+
+        # Draw the sparkline.
+        painter.save()
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        line_color = QtGui.QColor(0, 120, 215)    # blue
+        hover_line_color = QtGui.QColor(181, 181, 181)  # gray
+        text_color = QtGui.QColor(0, 0, 0)        # black
+        dot_color = QtGui.QColor(220, 0, 0)       # red
+        pen = QtGui.QPen(line_color)
+        pen.setWidth(1)
+        painter.setPen(pen)
+        painter.drawPolyline(poly)
+
+        # Hover overlay: snap to extrema if near, otherwise interpolate.
+        view = opt.widget
+        hover_index = view._sparkline_hover_index
+        hover_t = view._sparkline_hover_t
+        if hover_index is not None and hover_t is not None and hover_index == index:
+            x_line = rect.left() + hover_t * (rect.width() - 1)
+
+            snap_idx = None
+            if x.size >= 3:
+                extrema = []
+                for i in range(1, x.size - 1):
+                    if (y[i] >= y[i - 1] and y[i] >= y[i + 1]) or (
+                        y[i] <= y[i - 1] and y[i] <= y[i + 1]
+                    ):
+                        extrema.append(i)
+                if extrema:
+                    extrema = np.asarray(extrema, dtype=int)
+                    dists = np.abs(x_pix[extrema] - x_line)
+                    nearest = int(extrema[np.argmin(dists)])
+                    if dists.min() <= 6.0:
+                        snap_idx = nearest
+
+            if snap_idx is not None:
+                x_line = float(x_pix[snap_idx])
+                y_val = float(y[snap_idx])
+                y_marker = float(y_pix[snap_idx])
+            else:
+                try:
+                    if span_x == 0:
+                        y_val = float(np.nanmean(y))
+                    else:
+                        x_target = x_min + hover_t * span_x
+                        order = np.argsort(x)
+                        x_sorted = x[order]
+                        y_sorted = y[order]
+                        y_val = float(np.interp(x_target, x_sorted, y_sorted))
+                except Exception:
+                    y_val = None
+
+                if y_val is not None and np.isfinite(y_val):
+                    if span_y == 0:
+                        y_norm_val = 0.5
+                    else:
+                        y_norm_val = (y_val - y_min) / span_y
+                    y_norm_val = max(0.0, min(1.0, float(y_norm_val)))
+                    y_marker = rect.top() + (1 - y_norm_val) * (rect.height() - 1)
+                else:
+                    y_marker = None
+
+            painter.setPen(QtGui.QPen(hover_line_color))
+            painter.drawLine(QtCore.QPointF(x_line, rect.top()),
+                             QtCore.QPointF(x_line, rect.bottom()))
+
+            # Marker + value label.
+            if y_val is not None and np.isfinite(y_val) and y_marker is not None:
+                painter.save()
+                painter.setBrush(dot_color)
+                painter.setPen(QtGui.QPen(dot_color))
+                painter.drawEllipse(QtCore.QPointF(x_line, y_marker), 2.5, 2.5)
+                painter.restore()
+
+                text = prettify_notation(y_val)
+                metrics = painter.fontMetrics()
+                text_w = metrics.horizontalAdvance(text)
+                text_h = metrics.height()
+                box_w = text_w + 6
+                box_h = text_h + 4
+                text_left = x_line + 4
+                if text_left + box_w > rect.right():
+                    text_left = x_line - box_w - 4
+                text_left = max(rect.left(), min(text_left, rect.right() - box_w))
+                text_top = rect.top() + 2
+                if text_top + box_h > rect.bottom():
+                    text_top = rect.bottom() - box_h - 2
+                box_rect = QtCore.QRectF(text_left, text_top, box_w, box_h)
+                bg = QtGui.QColor(255, 255, 255, 210)
+                painter.fillRect(box_rect, bg)
+                painter.setPen(text_color)
+                painter.drawText(
+                    box_rect.adjusted(3, 2, -3, -2),
+                    Qt.AlignLeft | Qt.AlignVCenter,
+                    text,
+                )
+        painter.restore()
+
+    def paint(self, painter, option, index):
+        data = index.data(LINE_DATA_ROLE)
+        if data is None:
+            super().paint(painter, option, index)
+        else:
+            self._paint_sparkline(data, painter, option, index)
+        self._paint_provenance_marker(painter, option, index)
+
 
 class TableView(QtWidgets.QTableView):
     settings_changed = QtCore.pyqtSignal()
     log_view_requested = QtCore.pyqtSignal(int, int)  # proposal, run
+    model_updated = QtCore.pyqtSignal()
+    hierarchical_header_changed = QtCore.pyqtSignal(bool)
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
         self.setAlternatingRowColors(False)
-
-        self.setSortingEnabled(True)
-        self.sortByColumn(0, Qt.SortOrder.AscendingOrder)
+        self.hierarchical_header_enabled = True
+        self._restoring_column_widths = False
+        self._sparkline_hover_index = QtCore.QModelIndex()
+        self._sparkline_hover_t = None
 
         self.setSelectionBehavior(
             QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows
         )
 
-        self.horizontalHeader().sortIndicatorChanged.connect(self.style_comment_rows)
         self.verticalHeader().setMinimumSectionSize(ROW_HEIGHT)
-        self.verticalHeader().setStyleSheet("QHeaderView"
-                                            "{"
-                                            "background:white;"
-                                            "}")
+        self.setItemDelegate(ItemRendererDelegate(self))
+        self.setMouseTracking(True)
 
         # Add the widgets to be used in the column settings dialog
         self._columns_widget = QtWidgets.QListWidget()
@@ -46,34 +585,142 @@ class TableView(QtWidgets.QTableView):
         self._columns_widget.itemChanged.connect(self.item_changed)
         self._columns_widget.model().rowsMoved.connect(self.item_moved)
 
+        self._columns_widget.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._columns_widget.customContextMenuRequested.connect(self.show_delete_menu)
+
         self._static_columns_widget.itemChanged.connect(self.item_changed)
         self._static_columns_widget.setStyleSheet("QListWidget {padding: 0px;} QListWidget::item { margin: 5px; }")
         self._columns_widget.setStyleSheet("QListWidget {padding: 0px;} QListWidget::item { margin: 5px; }")
 
         self.context_menu = QtWidgets.QMenu(self)
         self.zulip_action = QtWidgets.QAction('Export table to the Logbook', self)
-        self.zulip_action.triggered.connect(self.export_selection_to_zulip)
         self.context_menu.addAction(self.zulip_action)
         self.show_logs_action = QtWidgets.QAction('View processing logs')
+        self.show_logs_action.setEnabled(False)  # Enabled with selection
         self.show_logs_action.triggered.connect(self.show_run_logs)
         self.context_menu.addAction(self.show_logs_action)
-    
-    def setModel(self, model):
+        self.process_action = QtWidgets.QAction('Reprocess runs')
+        self.context_menu.addAction(self.process_action)
+
+        # Add tag filtering support
+        self._current_tag_filter = set()  # Change to set for multiple tags
+        self._tag_filter_button = QtWidgets.QPushButton("Variables by Tag")
+        self._tag_filter_button.clicked.connect(self._show_tag_filter_menu)
+        # add column values filter support
+        self._filter_status = FilterStatus(self, parent)
+
+    def setModel(self, model: 'DamnitTableModel'):
         """
-        Overload of setModel() to make sure that we restyle the comment rows
-        when the model is updated.
+        Overload
         """
-        super().setModel(model)
+        if (old_sel_model := self.selectionModel()) is not None:
+            old_sel_model.deleteLater()
+        if (old_model := self.model()) is not None:
+            old_model.deleteLater()
+
+        self.damnit_model = model
+
+        sfpm = FilterProxy(self)
+        sfpm.setSourceModel(model)
+        sfpm.setSortRole(Qt.ItemDataRole.UserRole)  # Numeric sort where relevant
+        super().setModel(sfpm)
+
+        # When loading a new model, the saved column order is applied at the
+        # model level (changing column logical indices). So we need to reset
+        # any reordering from the view level, which maps logical indices to
+        # different visual indices, to show the columns as in the model.
+        self.setHorizontalHeader(FilterHeaderView(self))
+        header = self.horizontalHeader()
+        header.set_hierarchical_enabled(self.hierarchical_header_enabled)
+        header.setContextMenuPolicy(Qt.CustomContextMenu)
+        header.customContextMenuRequested.connect(self.show_horizontal_header_menu)
+        header.sectionResized.connect(self._on_section_resized)
+        # header.setSectionsMovable(True)  # TODO need to update variable order in the table / emit settings_changed
+
         if model is not None:
-            self.model().rowsInserted.connect(self.style_comment_rows)
             self.model().rowsInserted.connect(self.resize_new_rows)
+            self.model().columnsInserted.connect(self.on_columns_inserted)
+            self.model().columnsRemoved.connect(self.on_columns_removed)
+            self.model().filterChanged.connect(
+                lambda: header.update_filtered_columns(self.model().filters))
             self.resizeRowsToContents()
+
+        self.selectionModel().selectionChanged.connect(self.selection_changed)
+
+        self.model_updated.emit()
+
+    def _set_sparkline_hover(self, index, t):
+        self.setCursor(Qt.BlankCursor)
+        old_index = self._sparkline_hover_index
+        old_t = self._sparkline_hover_t
+        if old_index == index and old_t == t:
+            return
+        self._sparkline_hover_index = index
+        self._sparkline_hover_t = t
+        if old_index.isValid():
+            self.viewport().update(self.visualRect(old_index))
+        if index.isValid():
+            self.viewport().update(self.visualRect(index))
+
+    def _clear_sparkline_hover(self):
+        self.setCursor(Qt.ArrowCursor)
+        if not self._sparkline_hover_index.isValid():
+            self._sparkline_hover_t = None
+            return
+        old_index = self._sparkline_hover_index
+        self._sparkline_hover_index = QtCore.QModelIndex()
+        self._sparkline_hover_t = None
+        if old_index.isValid():
+            self.viewport().update(self.visualRect(old_index))
+
+    def mouseMoveEvent(self, event):
+        index = self.indexAt(event.pos())
+        if index.isValid() and index.data(LINE_DATA_ROLE) is not None:
+            rect = self.visualRect(index)
+            if rect.width() > 1:
+                t = (event.pos().x() - rect.left()) / (rect.width() - 1)
+            else:
+                t = 0.0
+            t = max(0.0, min(1.0, float(t)))
+            self._set_sparkline_hover(index, t)
+        else:
+            self._clear_sparkline_hover()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._clear_sparkline_hover()
+        super().leaveEvent(event)
+
+    def _on_section_resized(self, logical_index, old_size, new_size):
+        if self._restoring_column_widths:
+            return
+        if old_size == new_size:
+            return
+        header = self.horizontalHeader()
+        if header.sectionResizeMode(logical_index) == QtWidgets.QHeaderView.ResizeToContents:
+            return
+        self._queue_settings_changed()
+
+    @qthrottled(timeout=200, leading=False)
+    def _queue_settings_changed(self):
+        self.settings_changed.emit()
+
+    def selected_rows(self):
+        """Get indices of selected rows in the DamnitTableModel"""
+        proxy_rows = self.selectionModel().selectedRows()
+        # Translate indices in sorted proxy model back to the underlying model
+        proxy = self.model()
+        return [proxy.mapToSource(ix) for ix in proxy_rows]
+
+    def selection_changed(self):
+        has_sel = self.selectionModel().hasSelection()
+        self.show_logs_action.setEnabled(has_sel)
 
     def item_changed(self, item):
         state = item.checkState()
         self.set_column_visibility(item.text(), state == Qt.Checked)
 
-    def set_column_visibility(self, name, visible, for_restore=False):
+    def set_column_visibility(self, name, visible, for_restore=False, save_settings=True):
         """
         Make a column visible or not. This function should be used instead of the lower-level
         setColumnHidden().
@@ -85,7 +732,11 @@ class TableView(QtWidgets.QTableView):
         deselected. The `for_restore` argument lets you specify which behaviour
         you want.
         """
-        column_index = self.model()._data.columns.get_loc(name)
+        try:
+            column_index = self.damnit_model.find_column(name, by_title=True)
+        except KeyError:
+            log.error("Could not find column %r to set visibility", name)
+            return
 
         self.setColumnHidden(column_index, not visible)
 
@@ -100,12 +751,30 @@ class TableView(QtWidgets.QTableView):
             if len(matching_items) == 1:
                 item = matching_items[0]
                 item.setCheckState(Qt.Checked if visible else Qt.Unchecked)
-        else:
+        elif save_settings:
             self.settings_changed.emit()
 
+    def apply_column_widths(self, column_widths):
+        if not column_widths or not hasattr(self, "damnit_model") or self.damnit_model is None:
+            return
+        header = self.horizontalHeader()
+        self._restoring_column_widths = True
+        try:
+            for logical_idx, title in enumerate(self.damnit_model.column_titles):
+                width = column_widths.get(title)
+                if not isinstance(width, int):
+                    continue
+                if width <= 0:
+                    continue
+                if header.sectionResizeMode(logical_idx) == QtWidgets.QHeaderView.ResizeToContents:
+                    continue
+                self.setColumnWidth(logical_idx, int(width))
+        finally:
+            self._restoring_column_widths = False
+
     def item_moved(self, parent, start, end, destination, row):
-        # Take account of the static columns, and the Status column
-        col_offset = self._static_columns_widget.count() + 1
+        # Take account of the static columns
+        col_offset = self._static_columns_widget.count()
 
         col_from = start + col_offset
         col_to = self._columns_widget.currentIndex().row() + col_offset
@@ -114,25 +783,68 @@ class TableView(QtWidgets.QTableView):
 
         self.settings_changed.emit()
 
+    def show_delete_menu(self, pos):
+        item = self._columns_widget.itemAt(pos)
+        if item is None:
+            # This happens if the user clicks on blank space inside the widget
+            return
+
+        global_pos = self._columns_widget.mapToGlobal(pos)
+        menu = QtWidgets.QMenu()
+        menu.addAction("Delete")
+        action = menu.exec(global_pos)
+        if action is not None:
+            name = self.damnit_model.column_title_to_id(item.text())
+            self.confirm_delete_variable(name)
+
+    def confirm_delete_variable(self, name):
+        button = QMessageBox.warning(self, "Confirm deletion",
+                                     f"You are about to permanently delete the variable <b>'{name}'</b> "
+                                     "from the database and HDF5 files. This cannot be undone. "
+                                     "Are you sure you want to continue?",
+                                     QMessageBox.Yes | QMessageBox.No,
+                                     defaultButton=QMessageBox.No)
+        if button == QMessageBox.Yes:
+            model = self.damnit_model
+            delete_variable(model.db, name)
+            model.removeColumn(model.find_column(name, by_title=False))
+
     def add_new_columns(self, columns, statuses, positions = None):
         if positions is None:
             rows_count = self._columns_widget.count()
             positions = [ii + rows_count for ii in range(len(columns))]
+
         for column, status, position in zip(columns, statuses, positions):
-            if column in ["Status", "comment_id"]:
+            if column == "comment_id":
                 continue
 
             item = QtWidgets.QListWidgetItem(column)
             self._columns_widget.insertItem(position, item)
             item.setCheckState(Qt.Checked if status else Qt.Unchecked)
 
+    def on_columns_inserted(self, _parent, first, last):
+        titles = [self.damnit_model.column_title(i) for i in range(first, last + 1)]
+        self.add_new_columns(titles, [True for _ in list(titles)])
+
+    def on_columns_removed(self, _parent, _first, _last):
+        col_header_view = self.horizontalHeader()
+        cols = []
+        for logical_idx, title in enumerate(self.damnit_model.column_titles):
+            visual_idx = col_header_view.visualIndex(logical_idx)
+            visible = not col_header_view.isSectionHidden(logical_idx)
+            cols.append((visual_idx, title, visible))
+
+        # Put titles in display order (sort by visual indices)
+        cols.sort()
+
+        self.set_columns([c[1] for c in cols], [c[2] for c in cols])
+
     def set_columns(self, columns, statuses):
         self._columns_widget.clear()
         self._static_columns_widget.clear()
 
-        static_columns = ["Proposal", "Run", "Timestamp", "Comment"]
         for column, status in zip(columns, statuses):
-            if column in static_columns:
+            if column in STATIC_COLUMNS:
                 item = QtWidgets.QListWidgetItem(column)
                 self._static_columns_widget.addItem(item)
                 item.setCheckState(Qt.Checked if status else Qt.Unchecked)
@@ -140,9 +852,15 @@ class TableView(QtWidgets.QTableView):
                                                   QtWidgets.QSizePolicy.Minimum)
 
         # Remove the static columns
-        columns, statuses = map(list, zip(*[x for x in zip(columns, statuses)
-                                            if x[0] not in static_columns]))
-        self.add_new_columns(columns, statuses)
+        new_columns = []
+        new_statuses = []
+        for col, status in zip(columns, statuses):
+            if col in STATIC_COLUMNS:
+                continue
+            new_columns.append(col)
+            new_statuses.append(status)
+
+        self.add_new_columns(new_columns, new_statuses)
 
     def get_column_states(self):
         column_states = { }
@@ -157,16 +875,16 @@ class TableView(QtWidgets.QTableView):
 
         return column_states
 
-    def style_comment_rows(self, *_):
-        self.clearSpans()
-        data = self.model()._data
-
-        comment_col = data.columns.get_loc("Comment")
-        timestamp_col = data.columns.get_loc("Timestamp")
-
-        for row in data["comment_id"].dropna().index:
-            self.setSpan(row, 0, 1, timestamp_col)
-            self.setSpan(row, comment_col, 1, 1000)
+    def get_column_widths(self):
+        if not hasattr(self, "damnit_model") or self.damnit_model is None:
+            return {}
+        header = self.horizontalHeader()
+        widths = {}
+        for logical_idx, title in enumerate(self.damnit_model.column_titles):
+            width = header.sectionSize(logical_idx)
+            if width > 0:
+                widths[title] = int(width)
+        return widths
 
     def resize_new_rows(self, parent, first, last):
         for row in range(first, last + 1):
@@ -190,79 +908,572 @@ class TableView(QtWidgets.QTableView):
 
     def get_static_columns_count(self):
         return self._static_columns_widget.count()
-    
+
     def contextMenuEvent(self, event):
         self.context_menu.popup(QtGui.QCursor.pos())
 
-    def export_selection_to_zulip(self):
-        zulip_ok = self.model()._main_window.check_zulip_messenger()
-        if not zulip_ok:
-            return
-            
-        selected_rows = [r.row() for r in 
-                         self.selectionModel().selectedRows()]
-        df = pd.DataFrame(self.model()._main_window.data)
-        df = df.iloc[selected_rows]
-        
-        blacklist_columns = ['Proposal', 'Status']
-        blacklist_columns = blacklist_columns + self.columns_with_thumbnails(self.model()._data) \
-            + self.columns_invisible(df)
-        blacklist_columns = list(dict.fromkeys(blacklist_columns))
-        sorted_columns =['Run', 'Timestamp', 'Comment'] + \
-            [self._columns_widget.item(i).text() for i in range(self._columns_widget.count())]
-        
-        columns = [column for column in sorted_columns if column not in blacklist_columns] 
-        df = pd.DataFrame(df, columns=columns)
-        df.sort_values('Run', axis=0, inplace=True)
-        
-        if 'Timestamp' in df.columns:
-            df['Timestamp'] = df['Timestamp'].apply(timestamp2str)
-        
-        df = df.applymap(prettify_notation)
-        df.replace(["None", '<NA>', 'nan'], '', inplace=True)
-        self.model()._main_window.zulip_messenger.send_table(df)
-
     def show_run_logs(self):
         # Get first selected row
-        row = self.selectionModel().selectedRows()[0].row()
-        prop, run = self.model().row_to_proposal_run(row)
+        try:
+            row = self.selected_rows()[0].row()
+        except IndexError:
+            self.damnit_model._main_window.show_status_message(
+                "No row selected",
+                timeout=7000,
+                stylesheet=StatusbarStylesheet.ERROR
+            )
+            return
+        prop, run = self.damnit_model.row_to_proposal_run(row)
         self.log_view_requested.emit(prop, run)
-        
-    def columns_with_thumbnails(self, df):
-        obj_columns = df.dtypes == 'object'
-        blacklist_columns = []
-        for column in obj_columns.index:
-            for item in df[column]:
-                if isinstance(item, np.ndarray):
-                    blacklist_columns.append(column)
-                    break
-                   
-        return blacklist_columns
-    
-    def columns_invisible(self, df):
-        blacklist_columns = []
-        for column in range(0,self.model().columnCount()-1):
-            if self.isColumnHidden(column):
-                blacklist_columns.append(df.columns[column])
-        
-        return blacklist_columns
 
-    
-class Table(QtCore.QAbstractTableModel):
+    def _show_tag_filter_menu(self):
+        """Show a menu to select tag filtering."""
+        if not hasattr(self, 'damnit_model') or not self.damnit_model:
+            return
+
+        menu = QtWidgets.QMenu(self)
+
+        # Add "Show All" option
+        show_all_action = menu.addAction("Show All Variables")
+        show_all_action.triggered.connect(lambda: self.apply_tag_filter(set()))
+        if not self._current_tag_filter:
+            show_all_action.setEnabled(False)
+
+        menu.addSeparator()
+
+        # Add checkable actions for each tag
+        for tag in sorted(self.damnit_model.db.get_all_tags()):
+            action = menu.addAction(tag)
+            action.setCheckable(True)
+            action.setChecked(tag in self._current_tag_filter)
+            action.triggered.connect(lambda checked, t=tag: self._toggle_tag_filter(t))
+
+        menu.exec_(QtGui.QCursor.pos())
+
+    def _toggle_tag_filter(self, tag_name: str):
+        """Toggle a tag in the filter set and apply the filter."""
+        if tag_name in self._current_tag_filter:
+            self._current_tag_filter.remove(tag_name)
+        else:
+            self._current_tag_filter.add(tag_name)
+        self.apply_tag_filter(self._current_tag_filter)
+
+    @qthrottled(timeout=50, leading=False)
+    def apply_tag_filter(self, tag_names: set):
+        """Filter columns to show only variables with selected tags."""
+        self._current_tag_filter = tag_names
+
+        # Get user's column visibility preferences
+        column_states = self.get_column_states()
+
+        if not tag_names:
+            # Show all columns that were checked in the column widgets
+            for col, state in column_states.items():
+                self.set_column_visibility(col, state, save_settings=False)
+
+            self._tag_filter_button.setText("Variables by Tag")
+        else:
+            # Get all variables that have any of the selected tags
+            tagged_vars = set()
+            for tag in tag_names:
+                tagged_vars.update(self.damnit_model.db.get_variables_by_tag(tag))
+
+            # Hide/show columns based on whether they're tagged AND checked in column widgets
+            for idx, (col, state) in enumerate(column_states.items()):
+                is_static = idx < self.get_static_columns_count()
+                is_tagged = self.damnit_model.column_title_to_id(col) in tagged_vars
+
+                # Column should be visible if:
+                # 1. It's a static column that's checked in column widgets, or
+                # 2. It's a non-static column that's both tagged and checked in column widgets
+                show = state and (is_static or is_tagged)
+                self.set_column_visibility(col, show, save_settings=False)
+
+            # Update button text
+            if len(tag_names) == 1:
+                self._tag_filter_button.setText(f"Variables: {next(iter(tag_names))}")
+            else:
+                self._tag_filter_button.setText(f"Variables: {len(tag_names)} tags")
+
+    def get_toolbar_widgets(self):
+        """Return widgets to be added to the toolbar."""
+        return [self._tag_filter_button, self._filter_status]
+
+    def show_horizontal_header_menu(self, position):
+        pos = QCursor.pos()
+        index = self.horizontalHeader().logicalIndexAt(position)
+        menu = QMenu(self)
+        sort_asc_action = QAction(icon(FA6S.arrow_up_short_wide), "Sort Ascending", self)
+        sort_desc_action = QAction(icon(FA6S.arrow_down_wide_short), "Sort Descending", self)
+        filter_action = QAction(icon(FA6S.filter), "Filter", self)
+
+        menu.addAction(sort_asc_action)
+        menu.addAction(sort_desc_action)
+        menu.addSeparator()
+        menu.addAction(filter_action)
+
+        sort_asc_action.triggered.connect(lambda: self.sortByColumn(index, Qt.AscendingOrder))
+        sort_desc_action.triggered.connect(lambda: self.sortByColumn(index, Qt.DescendingOrder))
+        filter_action.triggered.connect(lambda: FilterMenu(index, self.model(), self).popup(pos))
+
+        menu.exec_(pos)
+
+    def set_hierarchical_header_enabled(self, enabled: bool, emit_signal=True):
+        enabled = bool(enabled)
+        if self.hierarchical_header_enabled == enabled:
+            return
+        self.hierarchical_header_enabled = enabled
+        header = self.horizontalHeader()
+        if isinstance(header, FilterHeaderView):
+            header.set_hierarchical_enabled(enabled)
+        if emit_signal:
+            self.hierarchical_header_changed.emit(enabled)
+            self.settings_changed.emit()
+
+
+class DamnitTableModel(QtGui.QStandardItemModel):
     value_changed = QtCore.pyqtSignal(int, int, str, object)
     time_comment_changed = QtCore.pyqtSignal(int, str)
     run_visibility_changed = QtCore.pyqtSignal(int, bool)
 
-    def __init__(self, main_window):
-        super().__init__()
-        self._main_window = main_window
+    def __init__(self, db: DamnitDB, column_settings: dict, parent):
+        self.column_ids, self.column_titles = self._load_columns(db, column_settings)
+        n_run_rows = db.conn.execute("SELECT count(*) FROM run_info").fetchone()[0]
+        log.info(f"Table will have {n_run_rows} runs")
+
+        super().__init__(n_run_rows, len(self.column_ids), parent)
+        self.setHorizontalHeaderLabels(self.column_titles)
+        self._main_window = parent
         self.is_sorted_by = ""
         self.is_sorted_order = None
-        self.editable_columns = {"Comment"}
+        self.db = db
+        self.column_index = {c: i for (i, c) in enumerate(self.column_ids)}
+        self.run_index = {}  # {(proposal, run): row}
 
-    @property
-    def _data(self):
-        return self._main_window.data
+        self.processing_jobs = QtExtractionJobTracker(self)
+        self.processing_jobs.run_jobs_changed.connect(self.update_processing_status)
+
+        self._bold_font = QtGui.QFont()
+        self._bold_font.setBold(True)
+
+        # Empty spaces are not editable by default
+        proto = QtGui.QStandardItem()
+        proto.setEditable(False)
+        self.setItemPrototype(proto)
+
+        self.user_variables = db.get_user_variables()
+        self.editable_columns = {"comment"} | {
+            vv.name for vv in self.user_variables.values()
+        }
+        for col_id in self.editable_columns:
+            col_ix = self.find_column(col_id)
+            for r in range(self.rowCount()):
+                # QStandardItem is editable by default
+                self.setItem(r, col_ix, QtGui.QStandardItem())
+
+        # Set up status column with checkboxes for runs
+        checkbox_proto = self.itemPrototype().clone()
+        checkbox_proto.setCheckable(True)
+        checkbox_proto.setCheckState(Qt.Checked)
+        for r in range(n_run_rows):
+            self.setItem(r, 0, checkbox_proto.clone())
+
+        self._load_from_db()
+
+    @staticmethod
+    def _load_columns(db: DamnitDB, col_settings):
+        t0 = time.perf_counter()
+        column_ids = (
+                ["Status", "proposal", "run", "start_time", "comment"]
+                + sorted(set(db.variable_names()) - {'comment'})
+        )
+        col_id_to_title = {
+            "run": "Run",
+            "proposal": "Proposal",
+            "start_time": "Timestamp",
+            "comment": "Comment",
+        } | dict(
+            db.conn.execute("""SELECT name, title FROM variables WHERE title NOT NULL""")
+        )
+        col_title_to_id = {t: n for (n, t) in col_id_to_title.items()}
+
+        # Column settings store human friendly titles - convert to IDs
+        saved_col_order = [col_title_to_id.get(c, c) for c in col_settings]
+
+        # Strip missing columns
+        saved_col_order = [col for col in saved_col_order if col in column_ids]
+
+        # Sort columns such that all static columns (proposal, run, etc) are at
+        # the beginning, followed by all the columns that have saved settings,
+        # followed by all the other columns (i.e. comment_id and any new columns
+        # added in between the last save and now).
+        non_static_cols = column_ids[5:]
+        sorted_cols = column_ids[:5]
+        # Static columns are saved too to store their visibility, but we filter
+        # them out here because they've already been added to the list.
+        sorted_cols.extend([col for col in saved_col_order if col not in sorted_cols])
+        # Add all other unsaved columns
+        sorted_cols.extend([col for col in non_static_cols if col not in saved_col_order])
+
+        column_titles = [col_id_to_title.get(c, c) for c in sorted_cols]
+
+        t1 = time.perf_counter()
+        log.info(f"Got columns in {t1 - t0:.3f} s")
+        return sorted_cols, column_titles
+
+    def _apply_provenance_style(self, item, provenance: str):
+        if provenance is None or provenance == "context.py":
+            return
+        item.setData(provenance, role=PROVENANCE_ROLE)
+        tip = item.toolTip() or ""
+        if tip.startswith("<"):
+            sep = "<br/>"
+        else:
+            sep = "\n" if tip else ""
+        item.setToolTip(f"{tip}{sep}Provenance: {provenance}")
+
+    def text_item(self, value, display=None):
+        if display is None:
+            if value is None:
+                display = ''
+            elif isinstance(value, float):
+                display = prettify_notation(value)
+            else:
+                display = str(value)
+        item = self.itemPrototype().clone()
+        # We will use UserRole data for sorting
+        item.setData(value, role=Qt.ItemDataRole.UserRole)
+        item.setData(display, role=Qt.ItemDataRole.DisplayRole)
+        return item
+
+    def image_item(self, png_data: bytes):
+        item = self.itemPrototype().clone()
+        item.setData(self.generateThumbnail(png_data), role=Qt.DecorationRole)
+        item.setToolTip(
+            f'<img src="data:image/png;base64,{b64encode(png_data).decode()}">'
+        )
+        return item
+
+    def line_item(self, line_data: np.ndarray):
+        item = self.itemPrototype().clone()
+        item.setData(line_data, role=LINE_DATA_ROLE)
+        item.setData("", role=Qt.ItemDataRole.DisplayRole)
+        return item
+
+    def comment_item(self, text):
+        item = self.text_item(text)
+        item.setToolTip(text)
+        item.setEditable(True)
+        return item
+
+    def error_item(self, attrs):
+        item = self.itemPrototype().clone()
+        msg = attrs['error']
+        match attrs.get('error_cls', ''):
+            case 'Skip':
+                colour = 'lightgrey'
+                msg = "Skipped: " + msg
+            case 'SourceNameError':  # Typically an issue with data, not code
+                colour = 'lightgrey'
+            case cls:
+                colour = 'orange'
+                msg = f'{msg}\n(see processing log for details)'
+                if cls != 'DependencyError':
+                    msg = f"{cls}: {msg}"
+        item.setToolTip(msg)
+        item.setData(QtGui.QColor(colour), Qt.ItemDataRole.DecorationRole)
+        return item
+
+    def new_item(self, value, column_id, max_diff, attrs, summary_type=None, provenance=None):
+        if summary_type == "trendline":
+            item = self.line_item(blob2numpy(value))
+        elif summary_type == "numpy":
+            arr = blob2numpy(value)
+            item = self.text_item(f"{arr.dtype}: {arr.shape}")
+        elif is_png_bytes(value):
+            item = self.image_item(value)
+        elif column_id == 'comment':
+            item = self.comment_item(value)
+        elif column_id == 'start_time':
+            item = self.text_item(value, timestamp2str(value))
+        elif 'error' in attrs:
+            item = self.error_item(attrs)
+        else:
+            item = self.text_item(value)
+            item.setEditable(column_id in self.editable_columns)
+            bold = attrs.get("bold")
+            if bold is None:
+                bold = (max_diff is not None) and max_diff > 1e-9
+            if bold:
+                item.setFont(self._bold_font)
+            if (bg := attrs.get('background')) is not None:
+                item.setBackground(QtGui.QBrush(QtGui.QColor(*bg)))
+
+        self._apply_provenance_style(item, provenance)
+        return item
+
+    def _load_from_db(self):
+        t0 = time.perf_counter()
+
+        row_headers = []
+        row_ix = -1
+
+        for row_ix, (prop, run, ts) in enumerate(self.db.conn.execute("""
+            SELECT proposal, run, start_time FROM run_info ORDER BY proposal, run
+        """).fetchall()):
+            row_headers.append(str(run))
+            self.run_index[(prop, run)] = row_ix
+            self.setItem(row_ix, 1, self.text_item(prop))
+            self.setItem(row_ix, 2, self.text_item(run))
+            self.setItem(row_ix, 3, self.text_item(ts, timestamp2str(ts)))
+
+        for (prop, run), grp in groupby(self.db.conn.execute("""
+            SELECT proposal, run, name, value, max_diff, summary_type, attributes, provenance FROM run_variables
+            ORDER BY proposal, run
+        """).fetchall(), key=lambda r: r[:2]):  # Group by proposal & run
+            row_ix = self.run_index[(prop, run)]
+            for *_, name, value, max_diff, summary_type, attr_json, provenance in grp:
+                col_ix = self.column_index[name]
+                if name in self.user_variables:
+                    value = self.user_variables[name].get_type_class().from_db_value(value)
+                if summary_type == "complex":
+                    value = blob2complex(value)
+                attrs = json.loads(attr_json) if attr_json else {}
+                self.setItem(row_ix, col_ix, self.new_item(value, name, max_diff, attrs, summary_type, provenance))
+
+        self.setVerticalHeaderLabels(row_headers)
+        t1 = time.perf_counter()
+        log.info(f"Filled rows in {t1 - t0:.3f} s")
+
+    def has_column(self, name, by_title=False):
+        if by_title:
+            return name in self.column_titles
+        else:
+            return name in self.column_index
+
+    def find_column(self, name, by_title=False):
+        if by_title:
+            try:
+                return self.column_titles.index(name)
+            except ValueError:  # Convert to KeyError, matching dict
+                raise KeyError(name)
+        else:
+            return self.column_index[name]
+
+    def column_title(self, col_ix):
+        return self.column_titles[col_ix]
+
+    def column_id(self, col_ix):
+        return self.column_ids[col_ix]
+
+    def column_title_to_id(self, title):
+        return self.column_id(self.find_column(title, by_title=True))
+
+    def computed_columns(self, by_title=False):
+        for i, col_id in enumerate(self.column_ids[5:], start=5):
+            if col_id not in self.editable_columns:
+                if by_title:
+                    yield self.column_titles[i]
+                else:
+                    yield col_id
+
+    def find_row(self, proposal, run):
+        return self.run_index[(proposal, run)]
+
+    def row_to_proposal_run(self, row_ix):
+        prop_col, run_col = 1, 2
+        prop_it, run_it = self.item(row_ix, prop_col), self.item(row_ix, run_col)
+        if prop_it is None:
+            return None, None
+        return prop_it.data(Qt.UserRole), run_it.data(Qt.UserRole)
+
+    def precreate_runs(self, n_runs: int):
+        proposal = self.db.metameta["proposal"]
+        start_run = max(
+            [r for (p, r) in self.run_index if p == proposal], default=0
+        ) + 1
+
+        for run in range(start_run, start_run + n_runs):
+            # To precreate the run we add it to the `run_info` table, and
+            # the `run_variables` table with an empty comment. Adding it to
+            # both ensures that the run will show up in the `runs` view.
+            self.db.ensure_run(proposal, run)
+            self.db.set_variable(proposal, run, "comment", ReducedData(None), provenance="")
+
+            self.insert_run_row(proposal, run, {}, {}, {})
+
+    def insert_columns(self, before: int, titles, column_ids=None, type_cls=None, editable=False):
+        if column_ids is None:
+            column_ids = titles
+        else:
+            assert len(column_ids) == len(titles)
+
+        self.column_ids[before:before] = column_ids
+        self.column_titles[before:before] = titles
+        self.column_index = {c: i for (i, c) in enumerate(self.column_ids)}
+        if editable:
+            self.editable_columns.update(column_ids)
+
+        self.insertColumns(before, len(column_ids))
+
+        for i, title in enumerate(titles, start=before):
+            self.setHorizontalHeaderItem(before, QtGui.QStandardItem(title))
+
+    def removeColumn(self, column: int, parent=QtCore.QModelIndex()):
+        del self.column_ids[column]
+        del self.column_titles[column]
+        self.column_index = {c: i for (i, c) in enumerate(self.column_ids)}
+        super().removeColumn(column, parent)
+
+    def insert_run_row(self, proposal, run, contents: dict, max_diffs: dict,
+                       attrs: dict, summary_types: dict = None,
+                       provenances: dict = None):
+        status_item = self.itemPrototype().clone()
+        status_item.setCheckable(True)
+        status_item.setCheckState(Qt.Checked)
+        row = [status_item, self.text_item(proposal), self.text_item(run)]
+
+        summary_types = summary_types or {}
+        provenances = provenances or {}
+        for column_id in self.column_ids[3:]:
+            if (value := contents.get(column_id, None)) is not None:
+                item = self.new_item(
+                    value,
+                    column_id,
+                    max_diffs.get(column_id) or 0,
+                    attrs.get(column_id) or {},
+                    summary_types.get(column_id),
+                    provenances.get(column_id),
+                )
+            elif column_id in self.editable_columns:
+                item = QtGui.QStandardItem()  # Editable by default
+            else:
+                item = None
+            row.append(item)
+        # We add new rows at the end, a QSortFilterProxyModel shows them in
+        # the correct position given the current sort.
+        self.run_index[(proposal, run)] = row_ix = self.rowCount()
+        self.appendRow(row)
+        self.setVerticalHeaderItem(row_ix, QtGui.QStandardItem(str(run)))
+        return row_ix
+
+    def handle_run_values_changed(self, proposal, run, values: dict):
+        known_col_ids = set(self.column_ids)
+        new_col_ids = [c for c in values if c not in known_col_ids]
+
+        if new_col_ids:
+            log.info("New columns for table: %s", new_col_ids)
+            # TODO: retrieve titles for new columns
+            self.insert_columns(self.columnCount(), new_col_ids)
+
+        try:
+            row_ix = self.find_row(proposal, run)
+            if not values:
+                # No need to update anything else
+                return
+            placeholders = ", ".join(["?"] * len(values))
+            query = (
+                "SELECT name, value, max_diff, summary_type, attributes, provenance "
+                "FROM run_variables WHERE proposal=? AND run=? "
+                f"AND name IN ({placeholders})"
+            )
+            params = (proposal, run, *values.keys())
+        except KeyError:
+            row_ix = None
+            query = (
+                "SELECT name, value, max_diff, summary_type, attributes, provenance "
+                "FROM run_variables WHERE proposal=? AND run=?"
+            )
+            params = (proposal, run)
+
+        data = {}
+        max_diffs = {}
+        attrs = {}
+        summary_types = {}
+        provenances = {}
+
+        for name, value, max_diff, summary_type, attr_json, provenance in self.db.conn.execute(query, params).fetchall():
+            data[name] = value
+            max_diffs[name] = max_diff
+            summary_types[name] = summary_type
+            attrs[name] = json.loads(attr_json) if attr_json else {}
+            provenances[name] = provenance
+
+        col_id_to_ix = {c: i for (i, c) in enumerate(self.column_ids)}
+
+        if row_ix is not None:
+            log.debug("Update existing row %s for run %s", row_ix, run)
+            for column_id in values:
+                col_ix = col_id_to_ix[column_id]
+                self.setItem(row_ix, col_ix, self.new_item(
+                    data.get(column_id),
+                    column_id,
+                    max_diffs.get(column_id) or 0,
+                    attrs.get(column_id) or {},
+                    summary_types.get(column_id),
+                    provenances.get(column_id),
+                ))
+        else:
+            self.insert_run_row(proposal, run, data, max_diffs, attrs, summary_types, provenances)
+
+    def handle_variable_set(self, var_info: dict):
+        col_id = var_info['name']
+        title = var_info['title'] or col_id
+        try:
+            col_ix = self.find_column(col_id)
+        except KeyError:
+            # New column
+            end = self.columnCount()
+            if var_info['type'] is None:
+                self.insert_columns(end, [title], [col_id])
+            else:
+                type_cls = value_types_by_name[var_info['type']]
+                self.insert_columns(
+                    end, [title], [col_id], type_cls=type_cls, editable=True
+                )
+        else:
+            # Update existing column
+            old_title = self.column_title(col_ix)
+            if title != old_title:
+                self.column_titles[col_ix] = title
+                self.setHorizontalHeaderItem(col_ix, QtGui.QStandardItem(title))
+
+    def handle_processing_state_set(self, info):
+        self.processing_jobs.on_processing_state_set(info)
+
+    def handle_processing_finished(self, info):
+        self.processing_jobs.on_processing_finished(info)
+
+    def update_processing_status(self, proposal, run, jobs_for_run):
+        """Show/hide the processing indicator for the given run"""
+        try:
+            row_ix = self.find_row(proposal, run)
+        except KeyError:
+            if jobs_for_run:
+                row_ix = self.insert_run_row(proposal, run, {}, {}, {})
+            else:
+                return
+
+        running = [j for j in jobs_for_run if j['status'] == 'RUNNING']
+
+        row_header_item = self.verticalHeaderItem(row_ix)
+        if running:
+            row_header_item.setData(f"{run} ⚙️", Qt.ItemDataRole.DisplayRole)
+            if len(running) == 1:
+                info = running[0]
+                msg = f"Processing on {info['username']}@{info['hostname']}"
+                if job_id := info['slurm_job_id']:
+                    msg += f" (Slurm job {job_id})"
+                row_header_item.setToolTip(msg)
+            else:
+                row_header_item.setToolTip(f"Processing in {len(running)} jobs")
+        elif jobs_for_run:
+            # Jobs in the list but not running must be pending
+            row_header_item.setData(f"{run} ⋮", Qt.ItemDataRole.DisplayRole)
+            row_header_item.setToolTip("Processing is queued")
+        else:
+            row_header_item.setData(f"{run}", Qt.ItemDataRole.DisplayRole)
+            row_header_item.setToolTip("")
 
     def add_editable_column(self, name):
         if name == "Status":
@@ -270,244 +1481,209 @@ class Table(QtCore.QAbstractTableModel):
         self.editable_columns.add(name)
 
     def remove_editable_column(self, name):
-        if name == "Comment":
+        if name == "comment":
             return
         self.editable_columns.remove(name)
 
-    def rowCount(self, index=None) -> int:
-        return self._data.shape[0]
-
-    def columnCount(self, parent=None) -> int:
-        return self._data.shape[1]
-
-    def insertRows(self, row, rows=1, index=QtCore.QModelIndex()):
-        self.beginInsertRows(QtCore.QModelIndex(), row, row + rows - 1)
-        self.endInsertRows()
-
-        return True
-
-    def insertColumns(self, column, columns=1, index=QtCore.QModelIndex()):
-        self.beginInsertColumns(QtCore.QModelIndex(), column, column + columns - 1)
-        self.endInsertColumns()
-
-        return True
-
-    @lru_cache(maxsize=500)
-    def generateThumbnail(self, run, proposal, quantity) -> QtGui.QPixmap:
+    @staticmethod
+    def generateThumbnail(data: bytes) -> QtGui.QPixmap:
         """
-        Helper function to generate a thumbnail for a 2D array.
-
-        Note that we require an index for self._data as the argument instead of
-        an ndarray. That's because this function is quite expensive and called
-        very often by self.data(), so for performance we try to cache the
-        thumbnails with @lru_cache. Unfortunately ndarrays are not hashable so
-        we have to take an index instead.
+        Helper function to generate a thumbnail from PNG data.
         """
-        df_row = self._data.loc[(self._data["Run"] == run) & (self._data["Proposal"] == proposal)]
-        image = df_row[quantity].item()
+        pixmap = QtGui.QPixmap()
+        pixmap.loadFromData(data, "PNG")
+        if pixmap.width() > THUMBNAIL_SIZE[0] or pixmap.height() > THUMBNAIL_SIZE[1]:
+            pixmap = pixmap.scaled(*THUMBNAIL_SIZE, Qt.KeepAspectRatio)
+        return pixmap
 
-        fig = Figure(figsize=(1, 1))
-        canvas = FigureCanvas(fig)
-        ax = fig.add_subplot()
-        fig.subplots_adjust(left=0, right=1, bottom=0, top=1)
-        vmin = np.nanquantile(image, 0.01, interpolation='nearest')
-        vmax = np.nanquantile(image, 0.99, interpolation='nearest')
-        ax.imshow(image, vmin=vmin, vmax=vmax, extent=(0, 1, 1, 0))
-        ax.axis('tight')
-        ax.axis('off')
-        ax.margins(0, 0)
-        canvas.draw()
+    def numbers_for_plotting(self, *cols, by_title=True):
+        col_ixs = [self.find_column(c, by_title) for c in cols]
+        res = [[]  for _ in cols]
+        for r in range(self.rowCount()):
+            status_item = self.item(r, 0)
+            if status_item is None or status_item.checkState() != Qt.Checked:
+                continue
 
-        width, height = int(fig.figbbox.width), int(fig.figbbox.height)
-        image = QtGui.QImage(canvas.buffer_rgba(), width, height, QtGui.QImage.Format_ARGB32)
-        return QtGui.QPixmap(image).scaled(QtCore.QSize(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
-                                           Qt.KeepAspectRatio)
+            vals = [self.get_value_at_rc(r, ci) for ci in col_ixs]
+            if all(isinstance(val, (int, float)) for val in vals):
+                for res_list, val in zip(res, vals):
+                    res_list.append(val)
 
-    @lru_cache(maxsize=1000)
-    def variable_is_constant(self, run, proposal, quantity):
-        """
-        Check if the variable at the given index is constant throughout the run.
-        """
-        is_constant = True
+        return res
 
-        try:
-            file_name, run_file = self._main_window.get_run_file(proposal, run, log=False)
-        except FileNotFoundError:
-            return is_constant
+    def get_value_at(self, index):
+        """Get the value for programmatic use, not for display"""
+        return self.itemFromIndex(index).data(Qt.UserRole)
 
-        if quantity in run_file:
-            ds = run_file[quantity]["data"]
+    def get_value_at_rc(self, row, col):
+        item = self.item(row, col)
+        return item.data(Qt.UserRole) if item is not None else None
 
-            # If it's an array
-            if len(ds.shape) == 1 and ds.shape[0] > 1:
-                data = ds[:]
-                is_constant = np.all(np.isclose(data, data[0]))
+    # QStandardItemModel assumes empty cells (no item) can be edited, regardless
+    # of itemPrototype. This override prevents editing empty cells.
+    def flags(self, model_index):
+        # Not using itemFromIndex() here, as it creates & inserts items
+        if model_index.isValid() and model_index.model() is self:
+            itm = self.item(model_index.row(), model_index.column())
+            if itm is not None:
+                return itm.flags()
 
-        run_file.close()
-        return is_constant
-
-    _supported_roles = (
-        Qt.CheckStateRole,
-        Qt.DecorationRole,
-        Qt.DisplayRole,
-        Qt.EditRole,
-        Qt.FontRole,
-        Qt.ToolTipRole
-    )
-
-    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
-        if role not in self._supported_roles:
-            return  # Fast exit for unused roles
-
-        if not index.isValid():
-            return
-
-        r, c = index.row(), index.column()
-        value = self._data.iat[r, c]
-        run = self._data.iat[r, self._data.columns.get_loc("Run")]
-        proposal = self._data.iat[r, self._data.columns.get_loc("Proposal")]
-        quantity_title = self._data.columns[index.column()]
-        quantity = self._main_window.col_title_to_name(quantity_title)
-
-        if role == Qt.FontRole:
-            # If the variable is not constant, make it bold
-            if not self.variable_is_constant(run, proposal, quantity):
-                font = QtGui.QFont()
-                font.setBold(True)
-                return font
-
-        elif role == Qt.DecorationRole:
-            if isinstance(value, np.ndarray):
-                return self.generateThumbnail(run, proposal, quantity_title)
-        elif role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.EditRole:
-            if isinstance(value, np.ndarray):
-                # The image preview for this is taken care of by the DecorationRole
-                return None
-
-            elif pd.isna(value) or index.column() == self._data.columns.get_loc("Status"):
-                return None
-
-            elif index.column() == self._data.columns.get_loc("Timestamp"):
-                return timestamp2str(value)
-
-            elif pd.api.types.is_float(value):
-                return prettify_notation(value)
-
-            else:
-                return str(value)
-
-        elif role == Qt.ItemDataRole.CheckStateRole \
-             and index.column() == self._data.columns.get_loc("Status") \
-             and not self.isCommentRow(index.row()):
-            if self._data["Status"].iloc[index.row()]:
-                return QtCore.Qt.Checked
-            else:
-                return QtCore.Qt.Unchecked
-
-        elif role == Qt.ToolTipRole:
-            if index.column() == self._data.columns.get_loc("Comment"):
-                return self.data(index)
-
-    def isCommentRow(self, row):
-        return row in self._data["comment_id"].dropna()
+        return Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsDragEnabled |Qt.ItemIsDropEnabled
 
     def setData(self, index, value, role=None) -> bool:
         if not index.isValid():
             return False
 
         if role == Qt.ItemDataRole.DisplayRole or role == Qt.ItemDataRole.EditRole:
-            # Change the value in the table
-            changed_column = self._main_window.col_title_to_name(self._data.columns[index.column()])
+            # A cell was edited in the table
+            changed_column = self.column_id(index.column())
             if changed_column == "comment":
-                self._data.iloc[index.row(), index.column()] = value
+                if not super().setData(index, value, role):
+                    return False
+                parsed = value
             else:
-                variable_type_class = self._main_window.get_variable_from_name(changed_column).get_type_class()
+                variable_type_class = self.user_variables[changed_column].get_type_class()
 
                 try:
-                    value = variable_type_class.convert(value, unwrap=True) if value != '' else None
-                    self._data.iloc[index.row(), index.column()] = value
+                    parsed = variable_type_class.parse(value) if value != '' else None
                 except Exception:
                     self._main_window.show_status_message(
-                        f"Value \"{value}\" is not valid for the \"{self._data.columns[index.column()]}\" column of type \"{variable_type_class}\".",
+                        f'Value {value!r} is not valid for the {variable_type_class} column "{self.column_titles[index.column()]}"',
                         timeout=5000,
                         stylesheet=StatusbarStylesheet.ERROR
                     )
                     return False
+                else:
+                    if not super().setData(index, parsed, Qt.ItemDataRole.UserRole):
+                        return False
 
-            self.dataChanged.emit(index, index)
+                    if parsed is None:
+                        display = ''
+                    elif isinstance(parsed, float):
+                        display = prettify_notation(value)
+                    else:
+                        display = str(parsed)
+                    if not super().setData(index, display, role):
+                        return False
 
-            # Send appropriate signals if we edited a standalone comment or an
-            # editable column.
-            prop, run = self._data.iloc[index.row()][["Proposal", "Run"]]
+            prop, run = self.row_to_proposal_run(index.row())
+            self.value_changed.emit(int(prop), int(run), changed_column, parsed)
 
-            if pd.isna(prop) and pd.isna(run) and changed_column == "comment":
-                comment_id = self._data.iloc[index.row()]["comment_id"]
-                if not pd.isna(comment_id):
-                    self.time_comment_changed.emit(comment_id, value)
-            elif self._data.columns[index.column()] in self.editable_columns:
-                if not (pd.isna(prop) or pd.isna(run)):
-                    self.value_changed.emit(int(prop), int(run), changed_column, value)
+            return True
 
         elif role == Qt.ItemDataRole.CheckStateRole:
-            new_state = not self._data["Status"].iloc[index.row()]
-            self._data["Status"].values[index.row()] = new_state
-            self.run_visibility_changed.emit(index.row(), new_state)
-
-        return True
-
-    def headerData(self, col, orientation, role=Qt.ItemDataRole.DisplayRole):
-        if (
-            orientation == Qt.Orientation.Horizontal
-            and role == Qt.ItemDataRole.DisplayRole
-        ):
-            name = self._data.columns[col]
-            return self._main_window.column_title(name)
-        elif(
-            orientation == Qt.Orientation.Vertical
-            and role == Qt.ItemDataRole.DisplayRole
-        ):
-            row = self._data.iloc[col]['Run']
-            if pd.isna(row):
-                row = ''
-            return row
-
-    def flags(self, index) -> Qt.ItemFlag:
-        item_flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
-
-        if self._data.columns[index.column()] in self.editable_columns:
-            item_flags |= Qt.ItemIsEditable
-        elif index.column() == self._data.columns.get_loc("Status"):
-            item_flags |= Qt.ItemIsUserCheckable
-
-        return item_flags
-
-    def sort(self, column, order):
-        is_sorted_by = self._data.columns.tolist()[column]
-
-        self.layoutAboutToBeChanged.emit()
-
-        try:
-            self._data.sort_values(
-                is_sorted_by,
-                ascending=order == Qt.SortOrder.AscendingOrder,
-                inplace=True,
+            if not super().setData(index, value, role):
+                return False
+            # CHeckboxes are only on the status column
+            self.run_visibility_changed.emit(
+                index.row(), (value == Qt.CheckState.Checked)
             )
-        except ValueError:
-            QtWidgets.QMessageBox.warning(self._main_window, "Sorting error",
-                                          "This column cannot be sorted")
-        else:
-            self.is_sorted_by = is_sorted_by
-            self.is_sorted_order = order
-            self._data.reset_index(inplace=True, drop=True)
-        finally:
-            self.layoutChanged.emit()
+            return True
 
-    def row_to_proposal_run(self, row_ix):
-        r = self._data.iloc[row_ix]
-        return r['Proposal'], r['Run']
+        return super().setData(index, value, role)
+
+    def dataframe_for_export(self, column_titles, rows=None, drop_image_cols=False):
+        """Create a cleaned-up dataframe to be saved as a spreadsheet"""
+        import pandas as pd
+        col_titles_to_ixs = {t: i for (i, t) in enumerate(self.column_titles)}
+        column_ixs = [col_titles_to_ixs[t] for t in column_titles]
+
+        if rows is None:
+            rows = range(self.rowCount())
+
+        if drop_image_cols:
+            filtered_ixs = []
+            for col_ix in column_ixs:
+                for row_ix in range(self.rowCount()):
+                    item = self.item(row_ix, col_ix)
+                    if item and is_png_bytes(item.data(Qt.UserRole)):
+                        break
+                else:
+                    filtered_ixs.append(col_ix)
+            column_ixs = filtered_ixs
+
+        # Put the dtype options in an order so we can promote columns to more
+        # general types based on their values.
+        col_dtype_options = [
+            pd.Float64Dtype(),  # Used if no values in selection
+            pd.BooleanDtype(),
+            pd.Int64Dtype(),
+            pd.Float64Dtype(),
+            pd.StringDtype(),   # For everything that's not covered above
+        ]
+        value_types = [type(None), bool, int, float]
+
+        cols_dict = {}
+        for col_ix in column_ixs:
+            values = []
+            col_type_ix = 0
+            for row_ix in rows:
+                item = self.item(row_ix, col_ix)
+                if self.column_ids[col_ix] == 'start_time':
+                    # Include timestamp as string
+                    val = item and item.data(Qt.DisplayRole)
+                else:
+                    val = item and item.data(Qt.UserRole)
+                    if val is None and item and item.data(Qt.DecorationRole):
+                        val = "<image>"
+                    if val is None and item and item.data(LINE_DATA_ROLE) is not None:
+                        val = "<trendline>"
+
+                values.append(val)
+                for i, pytype in enumerate(value_types):
+                    if isinstance(val, pytype):
+                        col_type_ix = max(col_type_ix, i)
+                        break
+                else:
+                    col_type_ix = 4
+
+            cols_dict[self.column_titles[col_ix]] = pd.Series(
+                values, dtype=col_dtype_options[col_type_ix]
+            )
+
+        df = pd.DataFrame(cols_dict)
+
+        row_labels = [self.headerData(r, Qt.Vertical) for r in rows]
+        df.index = row_labels
+
+        return df
+
+
+class QtExtractionJobTracker(ExtractionJobTracker, QtCore.QObject):
+    run_jobs_changed = QtCore.pyqtSignal(int, int, object) # prop, run, jobs
+
+    def __init__(self, parent):
+        super().__init__()
+        QtCore.QObject.__init__(self, parent)
+
+        # Check for crashed Slurm jobs every 2 minutes
+        self.slurm_check_timer = QtCore.QTimer(self)
+        self.slurm_check_timer.timeout.connect(self.check_slurm_jobs)
+        self.slurm_check_timer.start(120_000)
+
+    def squeue_check_jobs(self, cmd, jobs_to_check):
+        proc = QProcess(self)
+        proc.setProcessChannelMode(QProcess.ForwardedErrorChannel)
+
+        def done():
+            proc.deleteLater()
+            if proc.exitStatus() != QProcess.NormalExit or proc.exitCode() != 0:
+                log.warning("Error calling squeue")
+                return
+            stdout = bytes(proc.readAllStandardOutput()).decode()
+            self.process_squeue_output(stdout, jobs_to_check)
+
+        proc.finished.connect(done)
+        proc.start(cmd[0], cmd[1:])
+
+    def on_run_jobs_changed(self, proposal, run):
+        jobs = [i for i in self.jobs.values()
+                if i['proposal'] == proposal and i['run'] == run]
+        self.run_jobs_changed.emit(proposal, run, jobs)
+
 
 def prettify_notation(value):
-    if pd.api.types.is_float(value):
+    if isinstance(value, float):
         if value % 1 == 0 and abs(value) < 10_000:
             # If it has no decimal places, display it as an int
             return f"{int(value)}"
@@ -519,4 +1695,8 @@ def prettify_notation(value):
             return f"{value:.3e}"
     return f"{value}"
 
+def is_png_bytes(obj):
+    return isinstance(obj, bytes) and BlobTypes.identify(obj) is BlobTypes.png
 
+def is_numpy_bytes(obj):
+    return isinstance(obj, bytes) and BlobTypes.identify(obj) is BlobTypes.numpy

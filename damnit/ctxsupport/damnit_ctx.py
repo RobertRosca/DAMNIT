@@ -1,219 +1,46 @@
-"""This module is made available by manipulating sys.path
+"""Core DAMNIT context types and helpers.
+
+This module is made available by manipulating sys.path
 
 We aim to maintain compatibility with older Python 3 versions (currently 3.9+)
 than the DAMNIT code in general, to allow running context files in other Python
 environments.
 """
+import logging
 import re
-
-from functools import wraps
+import sys
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
 from enum import Enum
 
-import pandas as pd
+import h5py
+import numpy as np
+import xarray as xr
 
-class ValueType:
+from damnit_exceptions import GroupError, Skip
 
-    # These are intended to be overridden in subclasses.
-    type_instance = None
+__all__ = [
+    "Cell",
+    "Group",
+    "GroupError",
+    "RunData",
+    "Skip",
+    "Variable"
+]
 
-    type_name = None
-
-    description = None
-
-    examples = None
-
-    def __str__(self):
-        return self.type_name
-
-
-    @classmethod
-    def unwrap(cls, x):
-        if len(x) == 1:
-            return x.to_numpy().item()
-        return list(x)
-
-    @classmethod
-    def convert(cls, data, unwrap=False):
-        is_string = isinstance(data, str)
-        is_sequence = hasattr(data, "__len__") and not is_string
-
-        if not is_sequence:
-            data = [data]
-
-        if len(data) > 0:
-            res = pd.Series(data).convert_dtypes().astype(cls.type_instance)
-        else:
-            res = pd.Series([], dtype=cls.type_instance)
-
-        return cls.unwrap(res) if unwrap else res
-
-class BooleanValueType(ValueType):
-
-    type_instance = pd.BooleanDtype()
-
-    type_name = "boolean"
-
-    description = "A value type that can be used to denote truth values."
-
-    examples = ["True", "T", "true", "1", "False", "F", "f", "0"]
-
-    _valid_values = {
-        "true": True,
-        "yes": True,
-        "1": True,
-        "false": False,
-        "no": False,
-        "0": False
-    }
-
-    @classmethod
-    def _map_strings_to_values(cls, to_convert, valid_strings):
-        res = valid_strings.str.startswith(to_convert.lower())
-        n_matches = res.sum()
-        if n_matches == 1:
-            return cls._valid_values[valid_strings[res.argmax()]]
-        else:
-            raise ValueError(f"Value \"{to_convert}\" matches {'more than one' if n_matches > 0 else 'none'} of the allowed ones ({', '.join(valid_strings)})")
-
-    @classmethod
-    def convert(cls, data, unwrap=False):
-        is_string = isinstance(data, str)
-        is_sequence = hasattr(data, "__len__") and not is_string
-
-        if not is_sequence:
-            data = [data]
-
-        to_convert = pd.Series(data).convert_dtypes()
-        res = None
-
-        if len(data) > 0:
-            if to_convert.dtype == "object":
-                raise ValueError("The input array contains mixed object types")
-            elif to_convert.dtype == "string":
-                valid_strings = pd.Series(cls._valid_values.keys(), dtype="string")
-                res = to_convert.map(lambda x: cls._map_strings_to_values(x, valid_strings))
-            else:
-                res = to_convert.astype(cls.type_instance)
-        else:
-            res = pd.Series([], dtype=cls.type_instance)
-
-        return cls.unwrap(res) if unwrap else res
+log = logging.getLogger(__name__)
 
 
-class IntegerValueType(ValueType):
-
-    type_instance = pd.Int32Dtype()
-
-    type_name = "integer"
-
-    description = "A value type that can be used to count whole number of elements or classes."
-
-    examples = ["-7", "-2", "0", "10", "34"]
-
-class NumberValueType(ValueType):
-
-    type_instance = pd.Float32Dtype()
-
-    type_name = "number"
-
-    description = "A value type that can be used to represent decimal numbers."
-
-    examples = ["-34.1e10", "-7.1", "-4", "0.0", "3.141592653589793", "85.4E7"]
-
-class StringValueType(ValueType):
-
-    type_instance = pd.StringDtype()
-
-    type_name = "string"
-
-    description = "A value type that can be used to represent text."
-
-    examples = ["Broken", "Dark frame", "test_frame"]
-
-types_map = { tt.type_name : tt for tt in [BooleanValueType(), IntegerValueType(), NumberValueType(), StringValueType()] }
-
-def get_type_from_typename(type_name):
-
-    if type_name not in types_map:
-        raise ValueError(f"The type \"{type_name}\" is not valid available types are {', '.join(list(types_map.keys()))}")
-
-    return types_map[type_name]
+THUMBNAIL_SIZE = 300 # px
 
 
-class VariableBase:
+def isinstance_no_import(obj, mod: str, cls: str):
+    """Check if isinstance(obj, mod.cls) without loading mod"""
+    m = sys.modules.get(mod)
+    if m is None:
+        return False
 
-    def __new__(cls, *args, **kwargs):
-        if cls == VariableBase:
-            raise TypeError(f"only children of '{cls.__name__}' may be instantiated")
-        return super().__new__(cls)
-
-    def __init__(self, name=None, func=None, title=None, description=None, attributes={}):
-        self.store_result = False
-        self.func = func
-        self.name = name
-        self.title = title
-        self.description = description
-        self.attributes = attributes
-
-    @property
-    def name(self):
-        return self._name
-
-    @name.setter
-    def name(self, value):
-        if value and not re.fullmatch(r'[a-zA-Z_]\w+', value, flags=re.A):
-            raise ValueError(f"Error in variable: the variable name '{value}' is not of the form '[a-zA-Z_]\\w+'")
-        self._name = value
-
-    def arg_dependencies(self):
-        """
-        Get all direct dependencies of this Variable. Returns a dict of argument name
-        to variable name.
-        """
-        return { arg_name: annotation.removeprefix("var#")
-                 for arg_name, annotation in self.annotations().items()
-                 if annotation.startswith("var#") }
-
-    def annotations(self):
-        """
-        Get all annotated arguments of this Variable (including meta arguments,
-        unlike `Variable.dependencies()`).
-
-        Returns a dict of argument names to their annotations.
-        """
-        return getattr(self.func, '__annotations__', {})
-
-
-class UserEditableVariable(VariableBase):
-
-    def __init__(self, _name, title, variable_type, description=None, attributes={}):
-        super().__init__(name=_name, title=title, description=description, attributes=attributes)
-
-        self.variable_type = variable_type
-        self.func = self.get_data_func()
-
-    def get_data_func(self):
-
-        variable_name = self.name
-
-        def retrieve_data(inputs, proposal_id : 'meta#proposal', run_id : 'meta#run_number'):
-            db = inputs['db_conn']
-            res = db.execute(
-                f'SELECT {variable_name} FROM runs WHERE proposal=:proposal_id AND runnr=:run_id',
-                {
-                    'proposal_id' : proposal_id,
-                    'run_id' : run_id
-                }
-            )
-            # add cast
-            return res.fetchone()[0]
-
-        return retrieve_data
-
-        self.func = retrieve_data
-
-    def get_type_class(self):
-        return get_type_from_typename(self.variable_type)
+    return isinstance(obj, getattr(m, cls))
 
 
 class RunData(Enum):
@@ -221,33 +48,64 @@ class RunData(Enum):
     PROC = "proc"
     ALL = "all"
 
-class Variable(VariableBase):
 
-    def __init__(self, title=None, summary=None, data=None, cluster=False, description=None, attributes={}):
-        super().__init__(title=title, description=description, attributes=attributes)
+class Variable:
+    _name = None
 
-        self.store_result = True
+    def __init__(
+            self, title=None, description=None, summary=None, data=None,
+            cluster=False, tags=None, transient=False
+    ):
+        self.tags = (tags,) if isinstance(tags, str) else tags
+        self.description = description
         self.summary = summary
-
-        if data is not None and data not in ["raw", "proc"]:
-            raise ValueError(f"Error in Variable declaration: the 'data' argument is '{data}' but it should be either 'raw' or 'proc'")
-        else:
-            # Store the users original setting, this is used later to determine
-            # whether raw-data variables that depend on proc-data variables can
-            # automatically be promoted.
-            self._data = data
-
         self.cluster = cluster
+        self.transient = transient
+        self._data = data
+        self._annotation_overrides = None
 
+        if callable(title):
+            # @Variable called without parenthesis
+            func = title
+            self.title = None
+            self(func)
+        else:
+            self.title = title
+
+    # @Variable() is used as a decorator on a function that computes a value
     def __call__(self, func):
-
-        @wraps(func)
-        def get_default_inputs(inputs, **kwargs):
-            return func(inputs['run_data'], **kwargs)
-
-        self.func = get_default_inputs
+        self.func = func
         self.name = func.__name__
+        if self.title is None:
+            self.title = self.name
         return self
+
+    def __get__(self, instance, owner):
+        if is_group_instance(instance):
+            # Return a proxy that resolves the group name lazily after context exec.
+            return GroupBoundVariable(instance, self)
+        return self
+
+    def check(self):
+        problems = []
+        if not all(part.isidentifier() for part in self.name.split(".")):
+            problems.append(
+                f"The variable name {self.name!r} is not a valid Python identifier or dotted name"
+            )
+        if self._data not in (None, "raw", "proc"):
+            problems.append(
+                f"data={self._data!r} for variable {self.name} (can be 'raw'/'proc')"
+            )
+        if self.tags is not None:
+            if not isinstance(self.tags, Iterable) or not all(
+                isinstance(tag, str) and tag != "" for tag in self.tags
+            ):
+                problems.append(
+                    f"tags={self.tags!r} for variable {self.name} "
+                    "(must be a non-empty string or an iterable of strings)"
+                )
+
+        return problems
 
     @property
     def data(self):
@@ -256,4 +114,385 @@ class Variable(VariableBase):
         """
         return RunData.RAW if self._data is None else RunData(self._data)
 
+    def arg_dependencies(self, prefix="var#"):
+        """
+        Get all direct dependencies of this Variable with a certain
+        type/prefix. Returns a dict of argument name to variable name.
+        """
+        return { arg_name: annotation.removeprefix(prefix)
+                 for arg_name, annotation in self.annotations().items()
+                 if annotation.startswith(prefix) }
 
+    def annotations(self):
+        """
+        Get all annotated arguments of this Variable (including meta arguments,
+        unlike `Variable.dependencies()`).
+
+        Returns a dict of argument names to their annotations.
+        """
+        if self._annotation_overrides is not None:
+            return self._annotation_overrides
+        return getattr(self.func, '__annotations__', {})
+
+    def evaluate(self, run_data, kwargs):
+        cell = self.func(run_data, **kwargs)
+
+        if self.transient:
+            if not isinstance(cell, Cell):
+                cell = _DummyCell(cell)
+        else:
+            if not isinstance(cell, Cell):
+                cell = Cell(cell)
+
+            if cell.summary is None:
+                cell.summary = self.summary
+
+        return cell
+
+
+class _DummyCell:
+    """For transient results, holds data with no type checks"""
+    def __init__(self, data):
+        self.data = data
+
+
+class Cell:
+    """A container for data with customizable table display options.
+
+    Validates and converts input data to HDF5-compatible formats.
+    Provides flexible summary generation through direct values or numpy functions.
+    Supports visual customization with bold text and background colors.
+
+    Parameters
+    ----------
+    data : array-like, Figure, Dataset, str, or None
+        The main data to store
+    summary : str, optional
+        Name of numpy function to compute summary from data
+    summary_value : str or number, optional
+        Direct value to use as summary
+    bold : bool, optional
+        Whether to display cell in bold
+    background : str or sequence, optional
+        Cell background color as hex string ('#ffcc00') or RGB sequence (0-255)
+    preview : array or figure object, optional
+        A plot, 1D or 2D array to show when double-clicking the table cell.
+    """
+    def __init__(self, data, summary=None, summary_value=None, bold=None, background=None,
+                 *, preview=None):
+        # If the user returns an Axes, save the whole Figure
+        if isinstance_no_import(data, 'matplotlib.axes', 'Axes'):
+            data = data.get_figure()
+
+        isfig = isinstance_no_import(data, 'matplotlib.figure', 'Figure') or \
+                isinstance_no_import(data, 'plotly.graph_objs', 'Figure')
+
+        if not (isfig or isinstance(data, (xr.Dataset, xr.DataArray, str, type(None)))):
+            data = np.asarray(data)
+            # Numpy will wrap any Python object, but only native arrays
+            # can be saved in HDF5, not those containing Python objects.
+            if data.dtype.hasobject:
+                raise TypeError(f"Returned data type {type(data)} cannot be saved")
+            elif not np.issubdtype(data.dtype, np.number):
+                try:
+                    h5py.h5t.py_create(data.dtype, logical=True)
+                except TypeError:
+                    raise TypeError(
+                        f"Returned data type {type(data)} whose native "
+                        f"array type {data.dtype} cannot be saved",
+                    )
+
+        if summary_value is not None and not isinstance(summary_value, str):
+            arr = np.asarray(summary_value)
+            if arr.dtype.hasobject:
+                raise TypeError(f"summary_value should be number or string, not {type(summary)}")
+            elif not np.issubdtype(arr.dtype, np.number):
+                try:
+                    h5py.h5t.py_create(arr.dtype, logical=True)
+                except TypeError:
+                    raise TypeError(
+                        f"Summary value {type(arr)} whose native "
+                        f"array type {arr.dtype} cannot be saved",
+                    )
+            summary_value = arr
+
+        if preview is not None:
+            if isinstance(preview, (np.ndarray, xr.DataArray)):
+                if preview.ndim not in (1, 2):
+                    raise TypeError(
+                        f"preview should be a 1D or 2D array (shape is {preview.shape})"
+                    )
+                elif not (np.issubdtype(preview.dtype, np.number) or preview.dtype == bool):
+                    raise TypeError("preview array should be numeric")
+            elif isinstance_no_import(preview, 'matplotlib.axes', 'Axes'):
+                preview = preview.get_figure()
+            elif not (
+                    isinstance_no_import(preview, 'matplotlib.figure', 'Figure') or
+                    isinstance_no_import(preview, 'plotly.graph_objs', 'Figure')
+            ):
+                raise TypeError("preview must be an array or a figure object "
+                                f"(got {type(preview)})")
+
+        self.data = data
+        self.summary = summary
+        self.summary_value = summary_value
+        self.bold = bold
+        self.background = self._normalize_colour(background)
+        self.preview = preview
+
+    @staticmethod
+    def _normalize_colour(c):
+        if isinstance(c, str):
+            if not re.match(r'#[0-9A-Fa-f]{6}', c):
+                raise ValueError("Colour string should be hex code (like '#ffcc00')")
+            b = bytes.fromhex(c[1:])
+            return np.frombuffer(b, dtype=np.uint8)
+        elif isinstance(c, Sequence):
+            if not len(c) == 3:
+                raise TypeError(f"Wrong number of values ({len(c)}) for R,G,B")
+            if not all(0 <= v <= 255 for v in c):
+                raise ValueError("Colour values must be 0 - 255")
+            return np.array(c, dtype=np.uint8)
+        elif c is None:
+            return c
+        else:
+            raise TypeError(f"Don't understand colour as {type(c)}")
+
+    def get_summary(self, log_name="unknown"):
+        if self.summary_value is not None:
+            return self.summary_value
+        elif (self.data is not None) and (self.summary is not None):
+            try:
+                return np.asarray(getattr(np, self.summary)(self.data))
+            except Exception:
+                log.error("Failed to produce summary data for %s", log_name, exc_info=True)
+
+        # If a summary wasn't specified, try some default fallbacks
+        from damnit_writing import (
+            figure2png, plotly2png, generate_thumbnail, line_thumbnail,
+            downsample_line
+        )
+        data = self.preview if (self.preview is not None) else self.data
+        if isinstance(data, str):
+            return data
+        elif isinstance(data, xr.Dataset):
+            size = data.nbytes / 1e6
+            return f"Dataset ({size:.2f}MB)"
+        elif isinstance_no_import(data, 'matplotlib.figure', 'Figure'):
+            # For the sake of space and memory we downsample images to a
+            # resolution of THUMBNAIL_SIZE pixels on the larger dimension.
+            image_shape = data.get_size_inches() * data.dpi
+            zoom_ratio = min(1, THUMBNAIL_SIZE / max(image_shape))
+            try:
+                return figure2png(data, dpi=(data.dpi * zoom_ratio))
+            except:
+                logging.error("Error generating thumbnail for %s", log_name, exc_info=True)
+                return "<thumbnail error>"
+        elif isinstance_no_import(data, 'plotly.graph_objs', 'Figure'):
+            return plotly2png(data)
+
+        elif isinstance(data, (np.ndarray, xr.DataArray)):
+            if data.ndim == 0:
+                return data
+            elif data.ndim == 1:
+                try:
+                    return downsample_line(data)
+                except ModuleNotFoundError:
+                    logging.warning(
+                        'Downsampling library not found for trendline generation'
+                        ', falling back to thumbnail generation for %s', log_name
+                    )
+                    try:
+                        # fall back to generating thumbnail
+                        return line_thumbnail(data)
+                    except:
+                        logging.error(
+                            "Error generating thumbnail for %s", log_name, exc_info=True)
+                        return "<thumbnail error>"
+                except:
+                    logging.error(
+                        "Error generating trendline for %s", log_name, exc_info=True)
+                    return "<trendline error>"
+            elif data.ndim == 2:
+                if isinstance(data, np.ndarray):
+                    data = np.nan_to_num(data)
+                else:
+                    data = data.fillna(0)
+
+                try:
+                    return generate_thumbnail(data)
+                except:
+                    logging.error("Error generating thumbnail for %s", log_name, exc_info=True)
+                    return "<thumbnail error>"
+            else:
+                # Describe the full data (cell.data), not the preview data
+                return f"{self.data.dtype}: {self.data.shape}"
+
+        return None
+
+    def _max_diff(self):
+        a = self.data
+        if isinstance(a, (np.ndarray, xr.DataArray)) and a.size > 1:
+            if np.issubdtype(a.dtype, np.bool_):
+                return 1. if (True in a) and (False in a) else 0.
+            return np.abs(np.subtract(np.nanmax(a), np.nanmin(a)), dtype=np.float64)
+
+    def summary_attrs(self):
+        d = {}
+        if self.summary is not None:
+            d['summary_method'] = self.summary
+        if self.bold is not None:
+            d['bold'] = self.bold
+        if self.background is not None:
+            d['background'] = self.background
+        if (max_diff := self._max_diff()) is not None:
+            d['max_diff'] = max_diff
+        return d
+
+
+def _normalize_tags(tags) -> tuple[str]:
+    if tags is None:
+        return ()
+    if isinstance(tags, str):
+        return (tags,)
+    return tuple(tags)
+
+
+def _inherit_group_config(cls):
+    for base in cls.mro()[1:]:
+        config = base.__dict__.get("__damnit_group_config__")
+        if config is not None:
+            return config
+    return {}
+
+
+def Group(
+    _cls=None,
+    *,
+    tags: Iterable[str] | str | None = None,
+):
+    """Decorate a class to define a reusable group of Variables.
+
+    Group instances are dataclasses, therefore a Group subclass must also be
+    decorated with @Group. Instantiate them in the context file and access group
+    variables as "<group>.<var>" names. Use "self#..." in Variable annotations
+    to link to other group values or nested groups.
+
+    A group has 4 default parameters, they must be set at instantiation (except
+    for `tags`):
+        name: str | None = None
+            The group `name`. If None, the Group instance name assigned in the
+            context file will be used.
+        title: str | None = None
+            The group `title`. If None, the group `name` will be used as title.
+        tags: Iterable[str] | str | None = None
+            Tags to merge into each variable's tags.
+        sep: str = "/"
+            The separator between group title and variable title when generating
+            variable titles.
+
+    A Group decorator can define the default value of the Group instance `tags`.
+    `Tags` will be inherited from parent Group classes unless explicitly
+    overridden.
+    """
+    RESERVED_GROUP_FIELDS = {
+        "name": None,
+        "title": None,
+        "tags": None,
+        "sep": "/",
+    }
+
+    def wrap(cls):
+        # Prevent Group classes from shadowing internal config fields.
+        reserved_fields = set(RESERVED_GROUP_FIELDS)
+        defined_fields = set(getattr(cls, "__annotations__", {}))
+        conflicts = sorted(reserved_fields & defined_fields)
+        if conflicts:
+            raise GroupError(
+                "Group classes cannot define reserved fields: "
+                f"{', '.join(conflicts)}"
+            )
+        explicit_attrs = reserved_fields & set(cls.__dict__)
+        if explicit_attrs:
+            conflicts = ", ".join(sorted(explicit_attrs))
+            raise GroupError(
+                "Group classes cannot override reserved attributes: "
+                f"{conflicts}"
+            )
+
+        # inherit parents' Group tags if not redefined
+        parent_config = _inherit_group_config(cls)
+        nonlocal tags
+        if tags is None:
+            tags = parent_config.get("tags")
+        tags = _normalize_tags(tags)
+
+        cls.__damnit_group__ = True
+        cls.__damnit_group_config__ = RESERVED_GROUP_FIELDS.copy()
+        cls.__damnit_group_config__["tags"] = tags
+
+        annotations = dict(getattr(cls, "__annotations__", {}))
+        annotations.update({
+            "name": str | None,
+            "title": str | None,
+            "tags": Iterable[str] | str | None,
+            "sep": str,
+        })
+        cls.__annotations__ = annotations
+
+        cls.name = field(default=RESERVED_GROUP_FIELDS["name"], kw_only=True)
+        cls.title = field(default=RESERVED_GROUP_FIELDS["title"], kw_only=True)
+        cls.sep = field(default=RESERVED_GROUP_FIELDS["sep"], kw_only=True)
+        cls.tags = field(default=tags, kw_only=True)
+
+        original_post_init = getattr(cls, "__post_init__", None)
+
+        def __post_init__(self):
+            self.tags = _normalize_tags(self.tags)
+            if self.title is None:
+                self.title = self.name
+
+            if original_post_init is not None:
+                original_post_init(self)
+
+        cls.__post_init__ = __post_init__
+
+        return dataclass(cls, kw_only=True)
+
+    if _cls is None:
+        return wrap
+    return wrap(_cls)
+
+
+def is_group_instance(obj):
+    """Return True if obj is an instance of a Group class."""
+    return hasattr(type(obj), "__damnit_group__")
+
+
+class GroupBoundVariable:
+    """Proxy for accessing a Group `Variable` on an instance.
+
+    1. It allows you to wire dependencies before the group’s final name is
+       known, (because that name can be inferred from the global assignment
+       after the context code runs) so we don't have to mutate or reuse the
+       shared class-level Variable definition across instances by deferring the
+       per-instance binding work until expand_groups().
+    2. Prevents accidentally collecting this reference in case it leaks into the
+       context top level namespace, which would cause duplicate variable
+       definitions.
+
+    The proxy forwards all other attribute access to the original `Variable`, so
+    it behaves like a `Variable` for e.g. dependency wiring.
+    """
+    __damnit_group_bound__ = True
+
+    def __init__(self, group, var_def):
+        self._group = group
+        self._var_def = var_def
+
+    @property
+    def name(self):
+        return f"{self._group.name}.{self._var_def.name}"
+
+    def __getattr__(self, attr):
+        return getattr(self._var_def, attr)

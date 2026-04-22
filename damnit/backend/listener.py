@@ -3,25 +3,29 @@ import json
 import logging
 import os
 import platform
-import queue
-import subprocess
-import sys
+import sqlite3
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from socket import gethostname
 from threading import Thread
 
 from kafka import KafkaConsumer
 
-from .db import DamnitDB
-from .extract_data import RunData, process_log_path
+from ..context import RunData
+from ..definitions import DEFAULT_DAMNIT_PYTHON
+from ..api import find_proposal
+from .db import DamnitDB, KeyValueMapping, db_path
+from .extraction_control import ExtractionRequest, ExtractionSubmitter
+from .service import notify_ready
 
 # For now, the migration & calibration events come via DESY's Kafka brokers,
-# but the AMORE updates go via XFEL's test instance.
-CONSUMER_ID = 'xfel-da-amore-prototype-{}'
+# but the DAMNIT updates go via XFEL's test instance.
+CONSUMER_ID = 'xfel-da-damnit-{}'
 KAFKA_CONF = {
     'maxwell': {
-        'brokers': [f'it-kafka-broker{i:02}.desy.de' for i in range(1, 4)],
-        'topics': ["xfel-test-r2d2", "xfel-test-offline-cal"],
+        'brokers': ['exflwgs06:9091'],
+        'topics': ["test.r2d2", "cal.offline-corrections"],
         'events': ["migration_complete", "run_corrections_complete"],
     },
     'onc': {
@@ -30,85 +34,145 @@ KAFKA_CONF = {
         'events': ['daq_run_complete', 'online_correction_complete'],
     }
 }
+READONLY_WAIT_REOPEN = 2  # Wait N seconds to reopen after read-only error
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS proposal_databases(proposal, db_dir UNIQUE, official);
+CREATE INDEX IF NOT EXISTS proposals ON proposal_databases (proposal);
+
+-- Settings for the listener
+CREATE TABLE IF NOT EXISTS settings(key PRIMARY KEY NOT NULL, value)
+"""
 
 log = logging.getLogger(__name__)
 
+# tracking number of local threads running in parallel
+# only relevant if slurm isn't available
+MAX_CONCURRENT_THREADS = min(os.cpu_count() // 2, 10)
+local_extraction_threads = []
 
-def watch_processes_finish(q: queue.Queue):
-    procs_by_prop_run = {}
-    while True:
-        # Get new subprocesses from the main thread
+
+@dataclass
+class ProposalDBInfo:
+    db_dir: Path
+    official: bool
+
+
+def execute_direct(submitter, request):
+    for th in local_extraction_threads.copy():
+        if not th.is_alive():
+            local_extraction_threads.pop(local_extraction_threads.index(th))
+
+    if len(local_extraction_threads) >= MAX_CONCURRENT_THREADS:
+        log.warning(f'Too many events processing ({MAX_CONCURRENT_THREADS}), '
+                    f'skip event (p{request.proposal}, r{request.run}, {request.run_data.value})')
+        return
+    
+    def _run():
         try:
-            prop, run, popen = q.get(timeout=1)
-            procs_by_prop_run[prop, run] = popen
-        except queue.Empty:
-            pass
+            submitter.execute_direct(request)
+        except Exception:
+            log.error(f"Local extraction of p{request.proposal}, r{request.run} failed:", exc_info=True)
 
-        # Check if any of the subprocesses we're tracking have finished
-        to_delete = set()
-        for (prop, run), popen in procs_by_prop_run.items():
-            returncode = popen.poll()
-            if returncode is None:
-                continue  # Still running
+    extr = Thread(target=_run)
+    local_extraction_threads.append(extr)
+    extr.start()
 
-            # Can't delete from a dict while iterating over it
-            to_delete.add((prop, run))
-            if returncode == 0:
-                log.info("Data extraction for p%d r%d succeeded", prop, run)
-            else:
-                log.error(
-                    "Data extraction for p%d, r%d failed with exit code %d",
-                    prop, run, returncode
-                )
 
-        for prop, run in to_delete:
-            del procs_by_prop_run[prop, run]
+class ListenerDB:
+    def __init__(self, db_dir):
+        self.conn = sqlite3.connect(db_dir.absolute() / "listener.sqlite")
+        self.conn.executescript(SCHEMA)
+        self._settings = KeyValueMapping(self.conn, "settings")
 
+        # To help prevent accidentally starting multiple listeners we default to
+        # putting it in static mode.
+        self.settings.setdefault("static_mode", True)
+        self.settings.setdefault("allow_local_processing", False)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        self.conn.close()
+
+    @property
+    def settings(self):
+        return self._settings
+
+    def all_proposals(self):
+        rows = self.conn.execute("SELECT proposal, db_dir, official FROM proposal_databases").fetchall()
+        result = { }
+        for proposal, db_dir, official in rows:
+            if proposal not in result:
+                result[proposal] = []
+            result[proposal].append(ProposalDBInfo(Path(db_dir), bool(official)))
+        return result
+
+    def proposal_db_dirs(self, proposal: int):
+        rows = self.conn.execute("SELECT db_dir from proposal_databases WHERE proposal=?",
+                                 (proposal,)).fetchall()
+        return [Path(row[0]) for row in rows]
+
+    def add_proposal_db(self, proposal: int, db_dir, official: bool):
+        with self.conn:
+            self.conn.execute("""
+                INSERT INTO proposal_databases (proposal, db_dir, official) VALUES (?, ?, ?)
+            """, (proposal, str(db_dir), official))
+
+    def remove_proposal_db(self, db_dir):
+        with self.conn:
+            self.conn.execute("DELETE FROM proposal_databases WHERE db_dir=?", (str(db_dir),))
 
 class EventProcessor:
+    def __init__(self, listener_dir: Path):
+        self._listener_dir = listener_dir
+        self.db = ListenerDB(listener_dir)
 
-    def __init__(self, context_dir=Path('.')):
-        self.context_dir = context_dir
-        self.db = DamnitDB.from_dir(context_dir)
-        # Fail fast if read-only - https://stackoverflow.com/a/44707371/434217
-        self.db.conn.execute("pragma user_version=0;")
-        self.proposal = self.db.metameta['proposal']
-        log.info(f"Will watch for events from proposal {self.proposal}")
-
-        if gethostname().startswith('exflonc'):
+        hostname = gethostname()
+        if hostname.startswith('exflonc'):
             # running on the online cluster
             kafka_conf = KAFKA_CONF['onc']
         else:
             kafka_conf = KAFKA_CONF['maxwell']
 
-        consumer_id = CONSUMER_ID.format(self.db.metameta['db_id'])
+        group_id = CONSUMER_ID.format(str(listener_dir).replace("/", "_"))
+        client_id = CONSUMER_ID.format(f"{hostname}-{os.getpid()}")
         self.kafka_cns = KafkaConsumer(*kafka_conf['topics'],
                                        bootstrap_servers=kafka_conf['brokers'],
-                                       group_id=consumer_id)
+                                       group_id=group_id,
+                                       client_id=client_id,
+                                       consumer_timeout_ms=600_000,
+                                       )
         self.events = kafka_conf['events']
-
-        self.extract_procs_queue = queue.Queue()
-        self.extract_procs_watcher = Thread(
-            target=watch_processes_finish,
-            args=(self.extract_procs_queue,),
-            daemon=True
-        )
-        self.extract_procs_watcher.start()
+        log.info("Started listener")
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.kafka_cns.close()
-        self.db.close()
         return False
 
     def run(self):
-        for record in self.kafka_cns:
-            try:
-                self._process_kafka_event(record)
-            except Exception:
-                log.error("Unepected error handling Kafka event.", exc_info=True)
+        while True:
+            for record in self.kafka_cns:
+                try:
+                    self._process_kafka_event(record)
+                except sqlite3.OperationalError as e:
+                    if e.sqlite_errorcode == sqlite3.SQLITE_READONLY:
+                        log.error("SQLite database is read only. Pause, reopen, retry.")
+                        self.db.close()
+                        time.sleep(READONLY_WAIT_REOPEN)
+                        self.db = ListenerDB(self._listener_dir)
+                        self._process_kafka_event(record)
+                    else:
+                        log.error("Unexpected error handling Kafka event.", exc_info=True)
+                except Exception:
+                    log.error("Unexpected error handling Kafka event.", exc_info=True)
 
     def _process_kafka_event(self, record):
         msg = json.loads(record.value.decode())
@@ -135,34 +199,56 @@ class EventProcessor:
         proposal = int(msg['proposal'])
         run = int(msg['run'])
 
-        if proposal != self.proposal:
-            return
+        # If it's the first time we've seen this proposal and we're not in
+        # static mode, add it to the database.
+        try:
+            official_path = find_proposal(proposal) / "usr/Shared/amore"
+        except FileNotFoundError:
+            log.warning(f"Could not find proposal directory for p{proposal}")
+            official_path = None
 
-        self.db.ensure_run(proposal, run, record.timestamp / 1000)
-        log.info(f"Added p%d r%d ({run_data.value} data) to database", proposal, run)
+        if official_path and db_path(official_path).is_file() and not self.db.settings["static_mode"]:
+            if official_path not in self.db.proposal_db_dirs(proposal):
+                self.db.add_proposal_db(proposal, official_path, True)
 
-        log_path = process_log_path(run, proposal, self.context_dir)
-        log.info("Processing output will be written to %s",
-                 log_path.relative_to(self.context_dir.absolute()))
+        sandbox_args = self.db.settings.get("sandbox_args", "")
+        allow_local_processing = self.db.settings["allow_local_processing"]
+        for path in self.db.proposal_db_dirs(proposal):
+            try:
+                with DamnitDB.from_dir(path) as db:
+                    # Fail fast if read-only - https://stackoverflow.com/a/44707371/434217
+                    db.conn.execute("pragma user_version=0;")
 
-        with log_path.open('ab') as logf:
-            # Create subprocess to process the run
-            extract_proc = subprocess.Popen([
-                sys.executable, '-m', 'damnit.backend.extract_data',
-                str(proposal), str(run), run_data.value
-            ], cwd=self.context_dir, stdout=logf, stderr=subprocess.STDOUT)
-        self.extract_procs_queue.put((proposal, run, extract_proc))
+                    db.ensure_run(proposal, run, record.timestamp / 1000)
+                    log.info(f"Added p%d r%d ({run_data.value} data) to database", proposal, run)
 
-def listen():
+                    # Set the default to the stable DAMNIT module if not already set
+                    damnit_python = db.metameta.setdefault("damnit_python", DEFAULT_DAMNIT_PYTHON)
+                    submitter = ExtractionSubmitter(db.path.parent, db)
+                    req = ExtractionRequest(run, proposal, run_data, sandbox_args, damnit_python)
+
+                try:
+                    submitter.submit(req)
+                except Exception as e:
+                    if allow_local_processing:
+                        log.error("Slurm job submission failed, starting process locally.", exc_info=True)
+                        execute_direct(submitter, req)
+                    else:
+                        raise e
+            except Exception:
+                log.error(f"Processing p{proposal}, r{run} for {path} failed:", exc_info=True)
+
+def listen(db_dir):
     # Set up logging to a file
-    file_handler = logging.FileHandler("amore.log")
+    file_handler = logging.FileHandler("damnit.log")
     formatter = logging.root.handlers[0].formatter
     file_handler.setFormatter(formatter)
     logging.root.addHandler(file_handler)
 
     log.info(f"Running on {platform.node()} under user {getpass.getuser()}, PID {os.getpid()}")
+    notify_ready()
     try:
-        with EventProcessor() as processor:
+        with EventProcessor(db_dir) as processor:
             processor.run()
     except KeyboardInterrupt:
         log.error("Stopping on Ctrl + C")
@@ -171,11 +257,6 @@ def listen():
 
     # Flush all logs
     logging.shutdown()
-
-    # Ensure that the log file is writable by everyone (so that different users
-    # can start the backend).
-    if os.stat("amore.log").st_uid == os.getuid():
-        os.chmod("amore.log", 0o666)
 
 if __name__ == '__main__':
     listen()

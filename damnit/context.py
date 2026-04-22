@@ -6,5 +6,9 @@ if ctxsupport_dir not in sys.path:
     sys.path.insert(0, ctxsupport_dir)
 
 # Exposing these here for compatibility
-from damnit_ctx import RunData, UserEditableVariable, Variable
-from ctxrunner import ContextFile, Results, get_proposal_path
+from damnit_ctx import RunData, Variable, Group, GroupError, Cell, Skip
+from damnit_writing import DataType, PNGData, generate_thumbnail, save_fragment
+from ctxrunner import (
+    ContextFileErrors, ContextFile, Results,
+    add_to_h5_file, get_proposal_path,
+)
