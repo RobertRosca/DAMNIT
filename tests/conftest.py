@@ -3,14 +3,49 @@ import socket
 from time import time
 from unittest.mock import MagicMock
 
-import pytest
 import numpy as np
+import pytest
+from pytest_postgresql import factories as pg_factories
 
-from damnit.backend.db import DamnitDB
-from damnit.backend.user_variables import value_types_by_name, UserEditableVariable
+from damnit.backend.db import DamnitDB, reset_engine
+from damnit.backend.db.partitions import reset_cache
+from damnit.backend.user_variables import UserEditableVariable, value_types_by_name
 from damnit.gui.main_window import LogViewWindow
 
-from .helpers import amore_proto, mkcontext, extract_mock_run
+from .helpers import amore_proto, extract_mock_run, mkcontext
+
+
+postgresql_proc = pg_factories.postgresql_proc(port=None)
+postgresql = pg_factories.postgresql("postgresql_proc")
+
+
+@pytest.fixture
+def pg_db(postgresql, monkeypatch):
+    """Provide a fresh DAMNIT Postgres instance with the schema applied."""
+    info = postgresql.info
+    url = (
+        f"postgresql+psycopg://{info.user}:{info.password}@"
+        f"{info.host}:{info.port}/{info.dbname}"
+    )
+    monkeypatch.setenv("DAMNIT_DATABASE_URL", url)
+
+    # Ensure the engine picks up the new URL and start from an empty cache.
+    reset_engine()
+    reset_cache()
+
+    # Run the Alembic migrations to create the schema.
+    from alembic import command
+    from alembic.config import Config as AlembicConfig
+
+    cfg = AlembicConfig(os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                     "alembic.ini"))
+    cfg.set_main_option("sqlalchemy.url", url)
+    command.upgrade(cfg, "head")
+
+    yield url
+
+    reset_engine()
+    reset_cache()
 
 
 @pytest.fixture
@@ -171,9 +206,11 @@ def mock_run():
 
 
 @pytest.fixture
-def mock_db(tmp_path, mock_ctx, monkeypatch):
-    db = DamnitDB.from_dir(tmp_path)
-    db.metameta['proposal'] = 1234
+def mock_db(tmp_path, mock_ctx, pg_db, monkeypatch):
+    """Materialise a proposal + context file on disk backed by the test Postgres."""
+    proposal = 1234
+    monkeypatch.setenv("DAMNIT_PROPOSAL", str(proposal))
+    db = DamnitDB(proposal=proposal)
 
     (tmp_path / "context.py").write_text(mock_ctx.code)
 
@@ -192,7 +229,7 @@ def mock_db_with_data(mock_ctx, mock_db, monkeypatch):
 
     with monkeypatch.context() as m:
         m.chdir(db_dir)
-        amore_proto(["proposal", "1234"])
+        monkeypatch.setenv("DAMNIT_PROPOSAL", "1234")
         extract_mock_run(1)
 
     yield mock_db
@@ -204,7 +241,7 @@ def mock_db_with_data_2(mock_ctx, mock_db, monkeypatch):
 
     with monkeypatch.context() as m:
         m.chdir(db_dir)
-        amore_proto(["proposal", "1234"])
+        monkeypatch.setenv("DAMNIT_PROPOSAL", "1234")
         for run_num in range(1, 6):
             extract_mock_run(run_num)
 

@@ -29,6 +29,7 @@ from kafka import KafkaProducer
 from ..context import ContextFile, RunData
 from ..definitions import UPDATE_BROKERS, FILE_SUBMIT_TOPIC
 from .db import DamnitDB, ReducedData, BlobTypes, MsgKind, msg_dict
+from .db.notify import notify as _pg_notify
 from .extraction_control import ExtractionRequest, ExtractionSubmitter
 
 log = logging.getLogger(__name__)
@@ -178,11 +179,30 @@ def file_submit_msg(damnit_dir: Path, proposal: int, run: int, file_path: str):
     })
 
 
+def _current_proposal():
+    """Resolve the active proposal for contexts opened via `damnit` CLI.
+
+    The proposal is now part of the shared Postgres DB instead of a local
+    SQLite `metameta` table. CLI invocations inside a proposal directory rely
+    on the DAMNIT_PROPOSAL env var (set by the systemd/supervisord wrapper or
+    the user) so we don't have to probe the filesystem.
+    """
+    value = os.environ.get("DAMNIT_PROPOSAL")
+    if value is None:
+        raise RuntimeError(
+            "DAMNIT_PROPOSAL env var not set - cannot determine which proposal "
+            "to operate on. Set DAMNIT_PROPOSAL or pass --proposal."
+        )
+    return int(value)
+
+
 class Extractor:
     _proposal = None
 
-    def __init__(self, sandbox_args=None, connect_to_kafka=True):
-        self.db = DamnitDB()
+    def __init__(self, proposal=None, sandbox_args=None, connect_to_kafka=True):
+        if proposal is None:
+            proposal = _current_proposal()
+        self.db = DamnitDB(proposal=proposal)
         if connect_to_kafka:
             self.kafka_prd = KafkaProducer(
                 bootstrap_servers=UPDATE_BROKERS,
@@ -191,12 +211,12 @@ class Extractor:
         else:
             self.kafka_prd = None
 
-        context_python = self.db.metameta.get("context_python")
+        context_python = self.db.get_setting("context_python")
         self.ctx_whole, error_info = get_context_file(
             Path('context.py'),
             context_python=context_python,
             sandbox_args=sandbox_args,
-            sandbox_proposal=self.db.metameta['proposal']
+            sandbox_proposal=proposal,
         )
         if error_info is not None:
             raise RuntimeError(f"Error loading context file:\n{error_info[0]}")
@@ -204,17 +224,21 @@ class Extractor:
     def update_db_vars(self):
         updates = self.db.update_computed_variables(self.ctx_whole.vars_to_dict())
 
-        if self.kafka_prd is not None:
-            for name, var in updates.items():
-                self.kafka_prd.send(self.db.kafka_topic, msg_dict(
-                    MsgKind.variable_set, {'name': name} | var
-                ))
-            self.kafka_prd.flush()
+        for name, var in updates.items():
+            try:
+                self.db.variable_set(
+                    name,
+                    var.get("title") or name,
+                    var.get("description") or "",
+                    None,
+                )
+            except Exception:
+                log.exception("Failed to NOTIFY variable_set for %s", name)
 
 class RunExtractor(Extractor):
     def __init__(self, proposal, run, cluster=False, run_data=RunData.ALL,
                  match=(), variables=(), mock=False, uuid=None, sandbox_args=None):
-        super().__init__(sandbox_args=sandbox_args)
+        super().__init__(proposal=proposal, sandbox_args=sandbox_args)
         self.proposal = proposal
         self.run = run
         self.cluster = cluster
@@ -261,15 +285,19 @@ class RunExtractor(Extractor):
         return Path('extracted_data', f'p{self.proposal}_r{self.run}.h5')
 
     def _notify_running(self):
-        self.kafka_prd.send(self.db.kafka_topic, self.running_msg)
+        try:
+            self.db.processing_state_set(self.running_msg["data"])
+        except Exception:
+            log.exception("Failed to NOTIFY processing state")
 
     def _notify_finished(self):
-        self.kafka_prd.send(self.db.kafka_topic, msg_dict(
-            MsgKind.processing_finished, {'processing_id': self.uuid}
-        ))
+        try:
+            self.db.processing_finished({'processing_id': self.uuid})
+        except Exception:
+            log.exception("Failed to NOTIFY processing finished")
 
     def extract_in_subprocess(self):
-        python_exe = self.db.metameta.get('context_python', '') or sys.executable
+        python_exe = self.db.get_setting('context_python', '') or sys.executable
 
         args = []
         if self.sandbox_args is not None:
@@ -306,9 +334,9 @@ class RunExtractor(Extractor):
 
             for line in tf:
                 pth = line.decode().strip()
-                if pth and Path(pth).is_file():
+                if pth and Path(pth).is_file() and self.kafka_prd is not None:
                     self.kafka_prd.send(FILE_SUBMIT_TOPIC, file_submit_msg(
-                        self.db.path.parent, self.proposal, self.run, pth
+                        Path.cwd(), self.proposal, self.run, pth
                     ))
 
     def extract_and_ingest(self):
@@ -334,10 +362,12 @@ class RunExtractor(Extractor):
                 job_id, cluster = submitter.submit(cluster_req)
 
                 # Announce the newly submitted follow up job
-                self.kafka_prd.send(self.db.kafka_topic, msg_dict(
-                    MsgKind.processing_state_set,
-                    cluster_req.submitted_info(cluster, job_id)
-                ))
+                try:
+                    self.db.processing_state_set(
+                        cluster_req.submitted_info(cluster, job_id)
+                    )
+                except Exception:
+                    log.exception("Failed to NOTIFY submitted job")
 
         self._notify_finished()
 
@@ -391,7 +421,8 @@ def main(argv=None):
         extr.update_db_vars()
 
     extr.extract_and_ingest()
-    extr.kafka_prd.flush(timeout=10)
+    if extr.kafka_prd is not None:
+        extr.kafka_prd.flush(timeout=10)
 
 
 if __name__ == '__main__':

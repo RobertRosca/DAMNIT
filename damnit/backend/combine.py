@@ -16,7 +16,7 @@ from xarray.backends import H5NetCDFStore
 from ..context import DataType
 from ..definitions import FILE_SUBMIT_TOPIC, UPDATE_BROKERS
 from .db import DamnitDB, MsgKind, msg_dict
-from .extract_data import load_reduced_data, add_to_db
+from .extract_data import add_to_db, load_reduced_data
 from .service import notify_ready
 
 FRAGMENT_PATTERN = re.compile(r"p(\d+)_r(\d+).(.+).ready.h5$")
@@ -133,11 +133,12 @@ class FileSubmissionProcessor:
         new_data = load_reduced_data(src)
         combine(src, dst)
 
-        with DamnitDB.from_dir(damnit_dir) as db:
-            log.info("Updating database in %s with %s variables for p%d r%d from %s",
-                     damnit_dir, len(new_data), prop, run, provenance)
+        with DamnitDB(proposal=prop) as db:
+            log.info("Updating database for p%d r%d with %s variables from %s",
+                     prop, run, len(new_data), provenance)
             add_to_db(new_data, db, prop, run, provenance=provenance)
-            self.send_update(new_data, db.kafka_topic, prop, run)
+            names = [n for n in new_data if n != "start_time"]
+            db.run_values_updated(prop, run, names)
 
     @staticmethod
     def wait_file_exists(p: Path, msg_timestamp: datetime):
@@ -159,35 +160,36 @@ class FileSubmissionProcessor:
         )
         return True
 
-    def send_update(self, reduced_data, topic, proposal, run):
-        update_msg = msg_dict(MsgKind.run_values_updated, {
-            'run': run, 'proposal': proposal, 'values': {
-                name: None for name in reduced_data.keys()
-                if name != 'start_time'
-            }
-        })
-        self.producer.send(topic, update_msg)
+def gather_all_fragments(damnit_dir: Path, proposal: int = None):
+    """Consolidate extracted HDF5 fragments in ``damnit_dir``.
 
-
-def gather_all_fragments(damnit_dir: Path):
-    db = DamnitDB.from_dir(damnit_dir)
+    If ``proposal`` is not given, the proposal number is taken from the
+    filename (``p{proposal}_r{run}.*.ready.h5``).
+    """
     h5_dir = damnit_dir / "extracted_data"
 
     frag_files_matches = sorted(
         [(p, m) for p in h5_dir.iterdir() if (m := FRAGMENT_PATTERN.match(p.name))],
-        # Sort by mtime to process files in order written
         key=lambda t: t[0].stat().st_mtime
     )
 
-    for p, m in frag_files_matches:
-        proposal = int(m[1])
-        run = int(m[2])
+    db_by_proposal: dict[int, DamnitDB] = {}
+    try:
+        for p, m in frag_files_matches:
+            prop = int(m[1])
+            run = int(m[2])
 
-        new_data = load_reduced_data(p)
-        with h5py.File(p) as f:
-            provenance = f.attrs.get("provenance", "")
-        combine(p, h5_dir / f"p{proposal}_r{run}.h5")
-        add_to_db(new_data, db, proposal, run, provenance=provenance)
+            new_data = load_reduced_data(p)
+            with h5py.File(p) as f:
+                provenance = f.attrs.get("provenance", "")
+            combine(p, h5_dir / f"p{prop}_r{run}.h5")
+            if prop not in db_by_proposal:
+                db_by_proposal[prop] = DamnitDB(proposal=prop)
+            add_to_db(new_data, db_by_proposal[prop], prop, run,
+                      provenance=provenance)
+    finally:
+        for db in db_by_proposal.values():
+            db.close()
 
 
 def interrupted(signum, frame):

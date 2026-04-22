@@ -13,17 +13,18 @@ from damnit.cli import main, excepthook as ipython_excepthook
 def test_new_id(mock_db, monkeypatch):
     db_dir, db = mock_db
 
-    old_id = db.metameta["db_id"]
+    from damnit.backend.db import DamnitDB
 
-    # Test setting the ID with an explicit path
-    main(["new-id", str(db_dir)])
-    assert old_id != db.metameta["db_id"]
-
-    # Test with the default path (PWD)
+    # new-id rotates the install-wide db_id (stored in db_info).
     monkeypatch.chdir(db_dir)
-    old_id = db.metameta["db_id"]
+
+    def current_id():
+        with DamnitDB() as fresh:
+            return fresh.db_id
+
+    old_id = current_id()
     main(["new-id"])
-    assert old_id != db.metameta["db_id"]
+    assert old_id != current_id()
 
 def test_debug_repl(mock_db, monkeypatch):
     import IPython
@@ -101,20 +102,15 @@ def test_listen(tmp_path, monkeypatch):
     with pytest.raises(SystemExit):
         main(["listen", "--daemonize", "--test"])
 
-    listener_db_path = tmp_path / "listener.sqlite"
-    assert not listener_db_path.exists()
     main(["listener", "config", "static-mode", "0"])
-    assert listener_db_path.exists()
 
     db = ListenerDB(tmp_path)
     assert db.settings["static_mode"] == False
 
     # Helper function to check if a database directory is in the official location
     def get_official(proposal):
-        row = db.conn.execute(
-            "SELECT official FROM proposal_databases WHERE proposal=?", (proposal,)
-        ).fetchone()
-        return row[0] == 1
+        dirs = db.all_proposals().get(proposal, [])
+        return bool(dirs and dirs[0].official)
 
     mock_root = Path("/tmp/proposal")
     with patch("damnit.cli.find_proposal", return_value=str(mock_root)):
@@ -147,7 +143,7 @@ def test_listen(tmp_path, monkeypatch):
 
 def test_reprocess(mock_db_with_data, monkeypatch):
     db_dir, db = mock_db_with_data
-    db.metameta["proposal"] = 1234
+    monkeypatch.setenv("DAMNIT_PROPOSAL", "1234")
     monkeypatch.chdir(db_dir)
 
     # Create a proposal directory with raw/

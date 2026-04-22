@@ -22,6 +22,8 @@ from .roles import LINE_DATA_ROLE, PROVENANCE_ROLE
 from .table_filter import FilterMenu, FilterProxy, FilterStatus
 from .util import delete_variable, StatusbarStylesheet
 
+_ERROR_CLS_ATTR = "error_cls"
+
 log = logging.getLogger(__name__)
 
 ROW_HEIGHT = 30
@@ -1038,7 +1040,7 @@ class DamnitTableModel(QtGui.QStandardItemModel):
 
     def __init__(self, db: DamnitDB, column_settings: dict, parent):
         self.column_ids, self.column_titles = self._load_columns(db, column_settings)
-        n_run_rows = db.conn.execute("SELECT count(*) FROM run_info").fetchone()[0]
+        n_run_rows = db.count_runs()
         log.info(f"Table will have {n_run_rows} runs")
 
         super().__init__(n_run_rows, len(self.column_ids), parent)
@@ -1092,9 +1094,7 @@ class DamnitTableModel(QtGui.QStandardItemModel):
             "proposal": "Proposal",
             "start_time": "Timestamp",
             "comment": "Comment",
-        } | dict(
-            db.conn.execute("""SELECT name, title FROM variables WHERE title NOT NULL""")
-        )
+        } | db.variable_titles()
         col_title_to_id = {t: n for (n, t) in col_id_to_title.items()}
 
         # Column settings store human friendly titles - convert to IDs
@@ -1185,11 +1185,10 @@ class DamnitTableModel(QtGui.QStandardItemModel):
         return item
 
     def new_item(self, value, column_id, max_diff, attrs, summary_type=None, provenance=None):
-        if summary_type == "trendline":
-            item = self.line_item(blob2numpy(value))
-        elif summary_type == "numpy":
-            arr = blob2numpy(value)
-            item = self.text_item(f"{arr.dtype}: {arr.shape}")
+        if summary_type == "trendline" and isinstance(value, np.ndarray):
+            item = self.line_item(value)
+        elif summary_type == "numpy" and isinstance(value, np.ndarray):
+            item = self.text_item(f"{value.dtype}: {value.shape}")
         elif is_png_bytes(value):
             item = self.image_item(value)
         elif column_id == 'comment':
@@ -1218,27 +1217,25 @@ class DamnitTableModel(QtGui.QStandardItemModel):
         row_headers = []
         row_ix = -1
 
-        for row_ix, (prop, run, ts) in enumerate(self.db.conn.execute("""
-            SELECT proposal, run, start_time FROM run_info ORDER BY proposal, run
-        """).fetchall()):
+        for row_ix, (prop, run, ts, _added) in enumerate(self.db.list_runs()):
             row_headers.append(str(run))
             self.run_index[(prop, run)] = row_ix
             self.setItem(row_ix, 1, self.text_item(prop))
             self.setItem(row_ix, 2, self.text_item(run))
             self.setItem(row_ix, 3, self.text_item(ts, timestamp2str(ts)))
 
-        for (prop, run), grp in groupby(self.db.conn.execute("""
-            SELECT proposal, run, name, value, max_diff, summary_type, attributes, provenance FROM run_variables
-            ORDER BY proposal, run
-        """).fetchall(), key=lambda r: r[:2]):  # Group by proposal & run
+        rows = list(self.db.iter_run_variables())
+        for (prop, run), grp in groupby(rows, key=lambda r: (r[0], r[1])):
+            if (prop, run) not in self.run_index:
+                continue
             row_ix = self.run_index[(prop, run)]
-            for *_, name, value, max_diff, summary_type, attr_json, provenance in grp:
+            for _p, _r, name, value, max_diff, summary_type, attrs, provenance in grp:
+                if name not in self.column_index:
+                    continue
                 col_ix = self.column_index[name]
                 if name in self.user_variables:
                     value = self.user_variables[name].get_type_class().from_db_value(value)
-                if summary_type == "complex":
-                    value = blob2complex(value)
-                attrs = json.loads(attr_json) if attr_json else {}
+                attrs = attrs or {}
                 self.setItem(row_ix, col_ix, self.new_item(value, name, max_diff, attrs, summary_type, provenance))
 
         self.setVerticalHeaderLabels(row_headers)
@@ -1288,7 +1285,7 @@ class DamnitTableModel(QtGui.QStandardItemModel):
         return prop_it.data(Qt.UserRole), run_it.data(Qt.UserRole)
 
     def precreate_runs(self, n_runs: int):
-        proposal = self.db.metameta["proposal"]
+        proposal = self.db.proposal
         start_run = max(
             [r for (p, r) in self.run_index if p == proposal], default=0
         ) + 1
@@ -1371,20 +1368,10 @@ class DamnitTableModel(QtGui.QStandardItemModel):
             if not values:
                 # No need to update anything else
                 return
-            placeholders = ", ".join(["?"] * len(values))
-            query = (
-                "SELECT name, value, max_diff, summary_type, attributes, provenance "
-                "FROM run_variables WHERE proposal=? AND run=? "
-                f"AND name IN ({placeholders})"
-            )
-            params = (proposal, run, *values.keys())
+            names_filter = list(values.keys())
         except KeyError:
             row_ix = None
-            query = (
-                "SELECT name, value, max_diff, summary_type, attributes, provenance "
-                "FROM run_variables WHERE proposal=? AND run=?"
-            )
-            params = (proposal, run)
+            names_filter = None
 
         data = {}
         max_diffs = {}
@@ -1392,11 +1379,12 @@ class DamnitTableModel(QtGui.QStandardItemModel):
         summary_types = {}
         provenances = {}
 
-        for name, value, max_diff, summary_type, attr_json, provenance in self.db.conn.execute(query, params).fetchall():
+        for (_p, _r, name, value, max_diff, summary_type, attr_dict, provenance) in \
+                self.db.iter_run_variables(proposal=proposal, run=run, names=names_filter):
             data[name] = value
             max_diffs[name] = max_diff
             summary_types[name] = summary_type
-            attrs[name] = json.loads(attr_json) if attr_json else {}
+            attrs[name] = attr_dict or {}
             provenances[name] = provenance
 
         col_id_to_ix = {c: i for (i, c) in enumerate(self.column_ids)}

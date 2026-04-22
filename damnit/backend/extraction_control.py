@@ -145,14 +145,21 @@ class ExtractionSubmitter:
     def __init__(self, context_dir: Path, db: DamnitDB = None):
         self.context_dir = context_dir
         if db is None:
-            db = DamnitDB.from_dir(context_dir)
-        self.proposal = db.metameta['proposal']
-        self._concurrent_jobs = db.metameta.get("concurrent_jobs", 15)
-        self._slurm_time = db.metameta.get("slurm_time", "02:00:00")
-        self._noncluster_cpus = db.metameta.get('noncluster_cpus', '4')
-        self._noncluster_mem = db.metameta.get('noncluster_mem', '25G')
-        self._slurm_reservation = db.metameta.get('slurm_reservation', '')
-        self._slurm_partition = db.metameta.get('slurm_partition', '')
+            # Need an explicit proposal - take it from env if callers didn't
+            # pass a db. This used to be resolved from the sqlite metameta.
+            proposal_env = os.environ.get("DAMNIT_PROPOSAL")
+            if proposal_env is None:
+                raise ValueError(
+                    "ExtractionSubmitter needs either a DamnitDB or DAMNIT_PROPOSAL"
+                )
+            db = DamnitDB(proposal=int(proposal_env))
+        self.proposal = db.proposal
+        self._concurrent_jobs = db.get_setting("concurrent_jobs", 15)
+        self._slurm_time = db.get_setting("slurm_time", "02:00:00")
+        self._noncluster_cpus = db.get_setting("noncluster_cpus", "4")
+        self._noncluster_mem = db.get_setting("noncluster_mem", "25G")
+        self._slurm_reservation = db.get_setting("slurm_reservation", "") or ""
+        self._slurm_partition = db.get_setting("slurm_partition", "") or ""
 
     def _filter_env(self):
         env = os.environ.copy()
@@ -328,11 +335,15 @@ class ExtractionSubmitter:
 
 def reprocess(runs, proposal=None, match=(), mock=False, watch=False, direct=False, limit_running=-1):
     """Called by the 'damnit reprocess' subcommand"""
-    with DamnitDB.from_dir(Path.cwd()) as db:
+    if proposal is None:
+        proposal_env = os.environ.get("DAMNIT_PROPOSAL")
+        if proposal_env is None:
+            sys.exit("No proposal specified and DAMNIT_PROPOSAL is not set")
+        proposal = int(proposal_env)
+
+    with DamnitDB(proposal=proposal) as db:
         submitter = ExtractionSubmitter(Path.cwd(), db)
-        if proposal is None:
-            proposal = submitter.proposal
-        rows = db.conn.execute("SELECT proposal, run FROM runs").fetchall() if runs == ['all'] else None
+        rows = [(r[0], r[1]) for r in db.list_runs()] if runs == ['all'] else None
 
     if runs == ['all']:
         # Dictionary of proposal numbers to sets of available runs

@@ -224,16 +224,12 @@ def main(argv=None):
 
     new_id_ap = subparsers.add_parser(
         'new-id',
-        help="Set a new (random) database ID. Useful if a copy has been made which should not share an ID with the original."
-    )
-    new_id_ap.add_argument(
-        'db_dir', type=Path, default=Path.cwd(), nargs='?',
-        help="Path to the database directory"
+        help="Rotate the install-wide db_id used as the NOTIFY channel prefix."
     )
 
     config_ap = subparsers.add_parser(
         'db-config',
-        help="See or change config in this database"
+        help="See or change per-proposal config in this database"
     )
     config_ap.add_argument(
         '-d', '--delete', action='store_true',
@@ -250,24 +246,6 @@ def main(argv=None):
     config_ap.add_argument(
         'value', nargs='?',
         help="A new value for the given key"
-    )
-
-    migrate_ap = subparsers.add_parser(
-        "migrate",
-        help="Execute migrations to help upgrading. Do NOT execute a migration unless you know what you're doing."
-    )
-    migrate_ap.add_argument(
-        "--dry-run", action="store_true"
-    )
-    migrate_subparsers = migrate_ap.add_subparsers(dest="migrate_subcmd")
-    migrate_subparsers.add_parser(
-        "v0-to-v1",
-        help="Migrate the SQLite database and HDF5 files from v0 to v1."
-    )
-    migrate_subparsers.add_parser(
-        "intermediate-v1",
-        help="Migrate the SQLite database HDF5 files from an initial implementation of v1 to the final"
-             " v1. Don't use this unless you know what you're doing."
     )
 
     args = ap.parse_args(argv)
@@ -363,44 +341,74 @@ def main(argv=None):
         )
 
     elif args.subcmd == 'read-context':
+        import os as _os
         from .backend.extract_data import Extractor
-        Extractor(connect_to_kafka=not args.no_kafka).update_db_vars()
+        proposal = int(_os.environ["DAMNIT_PROPOSAL"]) if "DAMNIT_PROPOSAL" in _os.environ else None
+        Extractor(proposal=proposal, connect_to_kafka=not args.no_kafka).update_db_vars()
 
     elif args.subcmd == 'proposal':
-        from .backend.db import DamnitDB
-        db = DamnitDB()
-        currently_set = db.metameta.get('proposal', None)
+        import os as _os
+        config_dir = Path.home() / ".config" / "damnit"
+        state_file = config_dir / "current"
+        currently_set = None
+        if state_file.is_file():
+            try:
+                currently_set = int(state_file.read_text().strip())
+            except ValueError:
+                currently_set = None
+
         if args.proposal is None:
             print("Current proposal number:", currently_set)
         elif args.proposal == currently_set:
             print(f"No change - proposal {currently_set} already set")
         else:
-            db.metameta['proposal'] = args.proposal
+            config_dir.mkdir(parents=True, exist_ok=True)
+            state_file.write_text(f"{int(args.proposal)}\n")
             print(f"Changed proposal to {args.proposal} (was {currently_set})")
 
     elif args.subcmd == 'new-id':
-        from secrets import token_hex
-        from .backend.db import DamnitDB
-
-        db = DamnitDB.from_dir(args.db_dir)
-        db.metameta["db_id"] = token_hex(20)
-
-    elif args.subcmd == 'db-config':
         from .backend.db import DamnitDB
 
         db = DamnitDB()
-        handle_config_args(args, db.metameta)
+        new = db.new_db_id()
+        print(f"New db_id: {new}")
+        db.close()
 
-    elif args.subcmd == "migrate":
+    elif args.subcmd == 'db-config':
+        import os as _os
+        from collections.abc import MutableMapping
         from .backend.db import DamnitDB
-        from .migrations import migrate_intermediate_v1, migrate_v0_to_v1
 
-        db = DamnitDB(allow_old=True)
+        if "DAMNIT_PROPOSAL" not in _os.environ:
+            sys.exit("Set DAMNIT_PROPOSAL to the proposal number first")
+        db = DamnitDB(proposal=int(_os.environ["DAMNIT_PROPOSAL"]))
 
-        if args.migrate_subcmd == "v0-to-v1":
-            migrate_v0_to_v1(db, Path.cwd(), args.dry_run)
-        elif args.migrate_subcmd == "intermediate-v1":
-            migrate_intermediate_v1(db, Path.cwd(), args.dry_run)
+        class _SettingsProxy(MutableMapping):
+            _keys = (
+                "damnit_python", "context_python", "concurrent_jobs",
+                "slurm_time", "slurm_partition", "slurm_reservation",
+                "noncluster_cpus", "noncluster_mem",
+            )
+
+            def __getitem__(self, k):
+                v = db.get_setting(k)
+                if v is None:
+                    raise KeyError(k)
+                return v
+
+            def __setitem__(self, k, v):
+                db.set_setting(k, v)
+
+            def __delitem__(self, k):
+                db.set_setting(k, None)
+
+            def __iter__(self):
+                return iter(self._keys)
+
+            def __len__(self):
+                return len(self._keys)
+
+        handle_config_args(args, _SettingsProxy())
 
 if __name__ == '__main__':
     sys.exit(main())

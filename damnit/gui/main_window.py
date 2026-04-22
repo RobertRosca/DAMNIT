@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import QAction, QFileDialog, QMessageBox, QTabWidget
 
 from ..api import RunVariables
 from ..backend import initialize_proposal
-from ..backend.db import DamnitDB, MsgKind, ReducedData, db_path
+from ..backend.db import DamnitDB, MsgKind, ReducedData
 from ..backend.extraction_control import ExtractionSubmitter, process_log_path
 from ..backend.user_variables import UserEditableVariable
 from ..definitions import UPDATE_BROKERS
@@ -234,22 +234,27 @@ da-dev@xfel.eu"""
             }
             db[str(self._context_path)] = settings
 
-    def autoconfigure(self, path: Path):
-        sqlite_path = db_path(path)
-        # If the user selected an empty folder in the GUI, the database has been
-        # created before we reach this point, so this is just a sanity check.
-        if not sqlite_path.is_file():
-            QMessageBox.critical(self, "No DAMNIT database",
-                                 "The selected folder doesn't contain a DAMNIT database (runs.sqlite)")
-            return
-
+    def autoconfigure(self, path: Path, proposal: int = None):
+        # If the user selected an empty folder, initialize_proposal created
+        # the directory & registered the proposal before we get here.
         self.context_dir = path
         self._context_path = path / "context.py"
         self.extracted_data_template = str(path / "extracted_data/p{}_r{}.h5")
 
-        log.info("Reading data from database")
-        self.db = DamnitDB(sqlite_path)
-        self.db_id = self.db.metameta['db_id']
+        if proposal is None:
+            # Try to derive the proposal from the path (e.g. .../p001234/usr/Shared/amore)
+            for part in path.parts:
+                if part.startswith("p") and part[1:].isdigit():
+                    proposal = int(part[1:])
+                    break
+        if proposal is None:
+            QMessageBox.critical(self, "Unknown proposal",
+                                 "Could not determine proposal number for this directory.")
+            return
+
+        log.info("Opening proposal %s in Postgres", proposal)
+        self.db = DamnitDB(proposal=proposal)
+        self.db_id = self.db.db_id
         self.stop_update_listener_thread()
         self._updates_thread_launcher()
 
@@ -516,7 +521,7 @@ da-dev@xfel.eu"""
             log.info("Invalid input when searching run.")
             return
 
-        proposal = self.db.metameta['proposal']
+        proposal = self.db.proposal
         try:
             index_row = self.table.find_row(proposal, run)
         except KeyError:
@@ -560,7 +565,7 @@ da-dev@xfel.eu"""
         cleaned_df = self.table.dataframe_for_export(columns)
 
         if extension == ".xlsx":
-            proposal = self.db.metameta["proposal"]
+            proposal = self.db.proposal
             cleaned_df.to_excel(export_path, sheet_name=f"p{proposal} DAMNIT run table")
         elif extension == ".csv":
             cleaned_df.to_csv(export_path, index=False)
@@ -996,7 +1001,7 @@ da-dev@xfel.eu"""
             prop, sel_runs = max(sel_runs_by_prop.items(), key=lambda p: len(p[1]))
             sel_runs.sort()
         else:
-            prop = self.db.metameta.get("proposal", "")
+            prop = self.db.proposal or ""
             sel_runs = []
 
         var_ids_titles = zip(self.table.computed_columns(),
@@ -1195,23 +1200,19 @@ class LogViewWindow(QtWidgets.QMainWindow):
 
 
 def prompt_setup_db(context_dir: Path, prop_no=None, parent=None):
-    if not db_path(context_dir).is_file():
-
+    if not (context_dir / "context.py").is_file():
         button = QMessageBox.question(
-            parent, "Database not found",
-            f"{context_dir} does not contain a DAMNIT database, "
-            "would you like to create one?"
+            parent, "Proposal not initialized",
+            f"{context_dir} has not been set up for DAMNIT yet - "
+            "would you like to initialise it now?"
         )
         if button != QMessageBox.Yes:
             return False
 
-        if not (context_dir / 'context.py').is_file():
-            new_ctx_dialog = NewContextFileDialog(context_dir, parent)
-            context_file_src, user_vars_src = new_ctx_dialog.run_get_result()
-            if context_file_src is None:
-                return False
-        else:
-            context_file_src = user_vars_src = None
+        new_ctx_dialog = NewContextFileDialog(context_dir, parent)
+        context_file_src, user_vars_src = new_ctx_dialog.run_get_result()
+        if context_file_src is None:
+            return False
 
         if prop_no is None:
             prop_no, ok = QtWidgets.QInputDialog.getInt(
@@ -1220,7 +1221,7 @@ def prompt_setup_db(context_dir: Path, prop_no=None, parent=None):
             if not ok:
                 return False
         initialize_proposal(context_dir, prop_no, context_file_src, user_vars_src)
-        return True
+    return True
 
     return True
 

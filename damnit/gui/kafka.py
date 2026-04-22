@@ -1,11 +1,13 @@
-import json
+"""GUI-side Postgres LISTEN/NOTIFY agent.
+
+Kept at this path (``damnit.gui.kafka``) for backwards compatibility with
+existing imports. The underlying transport is now Postgres LISTEN/NOTIFY.
+"""
 import logging
 
-from kafka import KafkaConsumer, KafkaProducer
 from PyQt5 import QtCore
 
-from ..backend.db import MsgKind, msg_dict
-from ..definitions import UPDATE_BROKERS, UPDATE_TOPIC
+from ..backend.db import MsgKind, PgListener, channel_for, msg_dict
 
 log = logging.getLogger(__name__)
 
@@ -15,72 +17,50 @@ class UpdateAgent(QtCore.QObject):
 
     def __init__(self, db_id: str) -> None:
         QtCore.QObject.__init__(self)
-        self.update_topic = UPDATE_TOPIC.format(db_id)
-
-        self.kafka_cns = KafkaConsumer(
-            self.update_topic, bootstrap_servers=UPDATE_BROKERS
-        )
-        self.kafka_prd = KafkaProducer(
-            bootstrap_servers=UPDATE_BROKERS,
-            value_serializer=lambda d: json.dumps(d).encode('utf-8')
-        )
+        self._channel = channel_for(db_id)
+        self._listener = PgListener(self._channel)
         self.running = False
+
+    @property
+    def update_topic(self) -> str:
+        """Kept for API parity with the previous Kafka-based agent."""
+        return self._channel
 
     def listen_loop(self) -> None:
         self.running = True
-
-        while self.running:
-            # Note: this doesn't throw an exception on timeout, it just returns
-            # an empty dict.
-            topic_messages = self.kafka_cns.poll(timeout_ms=100)
-
-            for topic, messages in topic_messages.items():
-                for msg in messages:
-                    try:
-                        unpickled_msg = json.loads(msg.value)
-                    except Exception:
-                        log.error("Kafka event could not be un-pickled.", exc_info=True)
-                        continue
-
-                    self.message.emit(unpickled_msg)
+        try:
+            for kind, data in self._listener.iter_notifies():
+                if not self.running:
+                    break
+                if kind is None:
+                    continue
+                self.message.emit(msg_dict(MsgKind(kind), data))
+        except Exception:
+            log.exception("PgListener loop died unexpectedly")
 
     def run_values_updated(self, proposal, run, name):
-        message = msg_dict(MsgKind.run_values_updated,
-                           {
-                               "proposal": proposal,
-                               "run": run,
-                               "values": {
-                                   name: None
-                               }
-                           })
-
-        # Note: the send() function returns a future that we don't await
-        # immediately, but we call kafka_prd.flush() in stop() which will ensure
-        # that all messages are sent.
-        self.kafka_prd.send(self.update_topic, message)
+        # Emitting notifications is the backend's responsibility now - but we
+        # still surface a matching signal locally so that GUI code receives
+        # confirmation when we write from the GUI itself.
+        message = msg_dict(MsgKind.run_values_updated, {
+            "proposal": proposal,
+            "run": run,
+            "values": {name: None},
+        })
+        self.message.emit(message)
 
     def variable_set(self, name, title, description, variable_type):
-        message = msg_dict(MsgKind.variable_set,
-                           {
-                               "name": name,
-                               "title": title,
-                               "attributes": None,
-                               "type": variable_type
-                           })
-        self.kafka_prd.send(self.update_topic, message)
+        message = msg_dict(MsgKind.variable_set, {
+            "name": name,
+            "title": title,
+            "attributes": None,
+            "type": variable_type,
+        })
+        self.message.emit(message)
 
     def processing_submitted(self, info):
-        self.kafka_prd.send(self.update_topic, msg_dict(
-            MsgKind.processing_state_set, info,
-        ))
+        self.message.emit(msg_dict(MsgKind.processing_state_set, info))
 
     def stop(self):
         self.running = False
-        self.kafka_prd.flush(timeout=10)
-
-
-if __name__ == "__main__":
-    monitor = UpdateAgent("tcp://localhost:5556")
-
-    for record in monitor.kafka_cns:
-        print(record.value.decode())
+        self._listener.stop()

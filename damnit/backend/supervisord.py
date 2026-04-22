@@ -7,7 +7,6 @@ import subprocess
 import configparser
 from pathlib import Path
 
-from .db import db_path, DamnitDB
 
 
 log = logging.getLogger(__name__)

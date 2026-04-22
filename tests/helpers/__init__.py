@@ -1,3 +1,4 @@
+import os
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -32,11 +33,11 @@ def amore_proto(args):
     with patch("damnit.backend.extract_data.KafkaProducer"):
         main(args)
 
+
 def extract_mock_run(run_num: int, match=()):
     """Run the context file in the CWD on the specified run"""
+    prop = int(os.environ["DAMNIT_PROPOSAL"])
     with patch("damnit.backend.extract_data.KafkaProducer"):
-        db = DamnitDB()
-        prop = db.metameta['proposal']
         extr = RunExtractor(prop, run_num, match=match, mock=True)
         extr.update_db_vars()
         extr.extract_and_ingest()

@@ -169,7 +169,7 @@ def test_editor(mock_db, mock_ctx, qtbot):
     # Throwing an exception when evaluating the context file in a different
     # environment should be handled gracefully. This can happen if running the
     # ctxrunner itself fails, e.g. because of a missing dependency.
-    db.metameta["context_python"] = sys.executable
+    db.set_setting("context_python", sys.executable)
     with qtbot.waitSignal(editor.check_result) as sig, \
          patch("damnit.gui.editor.get_context_file", side_effect=Exception("foo")):
         editor.launch_test_context(db)
@@ -440,9 +440,10 @@ def test_autoconfigure(tmp_path, bound_port, request, qtbot):
         win.autoconfigure.assert_called_once_with(db_dir)
         initialize_proposal.assert_called_once_with(db_dir, 1234, template_path, None)
 
-    # Create the directory and database file to fake the database already existing
+    # Create the directory and context file to fake the proposal already existing
     db_dir.mkdir(parents=True)
-    DamnitDB.from_dir(db_dir)
+    (db_dir / "context.py").touch()
+    DamnitDB(proposal=1234)
 
     # Autoconfigure with database present
     with helper_patch() as initialize_proposal:
@@ -577,12 +578,28 @@ def test_user_vars(mock_ctx_user, mock_user_vars, mock_db, qtbot):
         assert add_var_win.result() == QDialog.Accepted
 
     # Check that the variable with the already existing name is not created
-    assert db.conn.execute("SELECT COUNT(*) FROM variables WHERE title = 'My cool integer'").fetchone()[0] == 0
+    from damnit.backend.db import Variable
+    from sqlalchemy import select, func
+    session = db.session
+
+    assert session.scalar(
+        select(func.count()).select_from(Variable)
+        .where(Variable.proposal == db.proposal)
+        .where(Variable.title == "My cool integer")
+    ) == 0
 
     # Check that the variable with the already existing title is not created
-    assert db.conn.execute("SELECT COUNT(*) FROM variables WHERE name = 'my_cool_integer'").fetchone()[0] == 0
+    assert session.scalar(
+        select(func.count()).select_from(Variable)
+        .where(Variable.proposal == db.proposal)
+        .where(Variable.name == "my_cool_integer")
+    ) == 0
 
-    row = db.conn.execute("SELECT name, type, title, description FROM variables WHERE name = 'my_integer'").fetchone()
+    row = session.execute(
+        select(Variable.name, Variable.type, Variable.title, Variable.description)
+        .where(Variable.proposal == db.proposal)
+        .where(Variable.name == "my_integer")
+    ).first()
 
     # Check that the variable added via the dialog is actually created
     assert row is not None
@@ -626,7 +643,8 @@ def test_user_vars(mock_ctx_user, mock_user_vars, mock_db, qtbot):
     def get_value_from_db(field_name):
         if not re.fullmatch(r"[a-zA-Z_]\w+", field_name, flags=re.A):
             raise ValueError(f"Error in field_name: the variable name '{field_name}' is not of the form '[a-zA-Z_]\\w+'")
-        return db.conn.execute(f"SELECT {field_name} FROM runs WHERE run = ?", (run_number,)).fetchone()[0]
+        result = db.get_variable(db.proposal, run_number, field_name)
+        return None if result is None else result[0]
 
     # Check that editing is prevented when trying to modfiy a non-editable column
     assert open_editor_and_get_delegate("dep_number").widget is None
@@ -1056,7 +1074,7 @@ def test_delete_variable(mock_db_with_data, qtbot, monkeypatch):
     assert len(tbl.column_titles) == tbl.columnCount()
     assert "Array" not in win.table_view.get_column_states()
 
-    proposal = db.metameta['proposal']
+    proposal = db.proposal
     with h5py.File(db_dir / f"extracted_data/p{proposal}_r1.h5") as f:
         assert "array" not in f.keys()
         assert "array" not in f[".reduced"].keys()
@@ -1067,7 +1085,7 @@ def test_precreate_runs(mock_db_with_data, qtbot, monkeypatch):
 
     win = MainWindow(db_dir, connect_to_kafka=False)
     qtbot.addWidget(win)
-    get_n_runs = lambda: db.conn.execute("SELECT COUNT(run) FROM runs").fetchone()[0]
+    get_n_runs = lambda: db.count_runs()
     n_runs = get_n_runs()
 
     # The user cancelling should do nothing

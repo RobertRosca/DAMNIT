@@ -184,8 +184,9 @@ class Editor(QsciScintilla):
         self._apply_theme()
 
     def launch_test_context(self, db):
-        context_python = db.metameta.get("context_python")
-        thread = ContextFileCheckerThread(self.text(), db.path.parent, context_python, get_context_file, parent=self)
+        from pathlib import Path
+        context_python = db.get_setting("context_python")
+        thread = ContextFileCheckerThread(self.text(), Path.cwd(), context_python, get_context_file, parent=self)
         thread.check_result.connect(self.on_test_result)
         thread.finished.connect(thread.deleteLater)
         thread.start()

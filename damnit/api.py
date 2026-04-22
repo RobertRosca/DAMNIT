@@ -9,6 +9,7 @@ import h5py
 import numpy as np
 
 from .backend.db import BlobTypes, DamnitDB, blob2complex, blob2numpy
+from .backend.db.values import decode_value
 from .util import isinstance_no_import
 
 
@@ -152,25 +153,16 @@ class VariableData:
         For user-editable variables like comments, this will be the same as
         [VariableData.read()][damnit.api.VariableData.read].
         """
-        result = self._db.conn.execute("""
-            SELECT value, summary_type, max(version) FROM run_variables
-            WHERE proposal=? AND run=? AND name=?
-        """, (self.proposal, self.run, self.name)).fetchone()
+        result = self._db.get_variable(self.proposal, self.run, self.name)
 
         if result is None:
             # This should never be reached unless the variable is deleted
             # after creating the VariableData object.
-            raise RuntimeError(f"Could not find value for '{self.name}' in p{self.proposal}, r{self.name}")
-        else:
-            value, summary_type, version = result
-            if isinstance(value, bytes):
-                if summary_type == "complex":
-                    return blob2complex(value)
-                if summary_type in ("numpy", "trendline"):
-                    return blob2numpy(value)
-                if BlobTypes.identify(value) is BlobTypes.numpy:
-                    return blob2numpy(value)
-            return value
+            raise RuntimeError(
+                f"Could not find value for '{self.name}' in p{self.proposal}, r{self.name}"
+            )
+        value, _summary_type, _attributes = result
+        return value
 
     def preview_data(self, *, data_fallback=True, deserialize_plotly=True):
         """Get the preview data for the variable
@@ -295,11 +287,11 @@ class RunVariables:
     ```
     """
 
-    def __init__(self, db_dir, run):
-        self._db = DamnitDB.from_dir(db_dir)
-        self._proposal = self._db.metameta["proposal"]
+    def __init__(self, db_dir, proposal, run):
+        self._db = DamnitDB(proposal=proposal)
+        self._proposal = proposal
         self._run = run
-        self._data_format_version = self._db.metameta["data_format_version"]
+        self._data_format_version = 1
         self._h5_path = Path(db_dir) / f"extracted_data/p{self._proposal}_r{self._run}.h5"
 
     @property
@@ -348,11 +340,8 @@ class RunVariables:
         user_vars.append("comment")
 
         for var_name in user_vars:
-            result = self._db.conn.execute("""
-                SELECT name, value, max(version) FROM run_variables
-                WHERE proposal=? AND run=? AND name=?
-            """, (self.proposal, self.run, var_name)).fetchone()
-            if result is not None and result[1] is not None:
+            result = self._db.get_variable(self.proposal, self.run, var_name)
+            if result is not None and result[0] is not None:
                 all_keys[var_name] = True
 
         return all_keys
@@ -366,10 +355,11 @@ class RunVariables:
         return sorted(self._key_locations().keys())
 
     def _var_titles(self):
-        result = self._db.conn.execute("SELECT name, title FROM variables").fetchall()
+        raw_titles = self._db.variable_titles()
         available_vars = self.keys()
-        titles = { row[0]: row[1] if row[1] is not None else row[0] for row in result
-                   if row[0] in available_vars }
+        titles = { name: (title if title is not None else name)
+                   for name, title in raw_titles.items()
+                   if name in available_vars }
 
         # These variables are created automatically, but they aren't included in
         # the `variables` table (yet) so we need to explicitly add their titles.
@@ -419,25 +409,33 @@ class Damnit:
         This is the entrypoint for inspecting data stored by DAMNIT.
 
         Args:
-            location (int or str or Path): This can be either a proposal number or
-                a path to a database directory.
+            location (int or str or Path): This can be either a proposal number
+                or a path to a proposal directory (whose parent will be consulted
+                via ``find_proposal`` to resolve the proposal number).
         """
         if isinstance(location, int):
-            proposal_path = find_proposal(location)
-            self._db_dir = proposal_path / "usr/Shared/amore"
+            self._proposal = location
+            try:
+                proposal_path = find_proposal(location)
+                self._db_dir = proposal_path / "usr/Shared/amore"
+            except FileNotFoundError:
+                self._db_dir = Path.cwd()
         elif isinstance(location, (Path, str)):
-            self._db_dir = Path(location)
+            path = Path(location)
+            if not path.is_dir():
+                raise FileNotFoundError(f"DAMNIT directory does not exist: {path}")
+            self._db_dir = path
+            name = path.parent.parent.parent.name
+            if name.startswith("p") and name[1:].isdigit():
+                self._proposal = int(name[1:])
+            else:
+                raise ValueError(
+                    "Could not derive proposal number from path. Pass an int."
+                )
         else:
             raise TypeError(f"Unsupported location: {location}")
 
-        if not self._db_dir.is_dir():
-            raise FileNotFoundError(f"DAMNIT directory does not exist: {self._db_dir}")
-
-        self._db_path = self._db_dir / "runs.sqlite"
-        if not self._db_path.is_file():
-            raise FileNotFoundError(f"DAMNIT database does not exist: {self._db_path}")
-
-        self._db = DamnitDB(self._db_path)
+        self._db = DamnitDB(proposal=self._proposal)
 
     def __getitem__(self, obj):
         if isinstance(obj, int):
@@ -450,13 +448,13 @@ class Damnit:
         if run not in self.runs():
             raise KeyError(f"Unknown run number for p{self.proposal}")
 
-        run_vars = RunVariables(self._db_dir, run)
+        run_vars = RunVariables(self._db_dir, self._proposal, run)
         return run_vars[variable] if variable is not None else run_vars
 
     @property
     def proposal(self) -> int:
         """The currently active proposal of the database."""
-        return self._db.metameta["proposal"]
+        return self._proposal
 
     def runs(self) -> list:
         """A list of all existing runs.
@@ -464,8 +462,8 @@ class Damnit:
         Note that this does not include runs that were pre-created through the
         GUI but were never taken by the DAQ.
         """
-        result = self._db.conn.execute("SELECT run FROM run_info WHERE start_time IS NOT NULL").fetchall()
-        return [row[0] for row in result]
+        return [run for (_prop, run, start_time, _added_at) in self._db.list_runs()
+                if start_time is not None]
 
     def table(self, with_titles=False) -> "pd.DataFrame":
         """Retrieve the run table as a [DataFrame][pandas.DataFrame].
@@ -483,53 +481,33 @@ class Damnit:
         """
         import pandas as pd
 
-        df = pd.read_sql_query("SELECT * FROM runs", self._db.conn)
+        rows = self._db.list_runs()
+        per_run = {(p, r): {"proposal": p, "run": r, "start_time": s}
+                   for (p, r, s, _a) in rows}
 
-        # Convert the start_time into a datetime column
-        start_time = pd.to_datetime(df["start_time"], unit="s", utc=True)
-        df["start_time"] = start_time.dt.tz_convert("Europe/Berlin")
+        for (p, r, name, value, _md, _st, _attrs, _prov) in self._db.iter_run_variables():
+            if name == "start_time":
+                continue
+            if isinstance(value, np.ndarray):
+                value = "<image>"
+            elif isinstance(value, (bytes, bytearray)):
+                value = "<image>" if BlobTypes.identify(bytes(value)) in \
+                    (BlobTypes.png, BlobTypes.numpy) else "<unknown>"
+            per_run.setdefault((p, r), {"proposal": p, "run": r, "start_time": None})
+            per_run[(p, r)][name] = value
 
-        # Delete added_at, this is internal
-        del df["added_at"]
-
-        # Ensure that there's always a comment column for consistency, it may
-        # not be present if no comments were made.
+        df = pd.DataFrame(list(per_run.values()))
+        if not df.empty:
+            start_time = pd.to_datetime(df["start_time"], unit="s", utc=True)
+            df["start_time"] = start_time.dt.tz_convert("Europe/Berlin")
         if "comment" not in df:
-            df.insert(3, "comment", None)
+            df["comment"] = None
 
-        # interpret blobs
-        def blob2type(value, summary_type=None):
-            if isinstance(value, bytes):
-                if summary_type == "complex":
-                    return blob2complex(value)
-                match BlobTypes.identify(value):
-                    case BlobTypes.png | BlobTypes.numpy:
-                        return "<image>"
-                    case BlobTypes.unknown | _:
-                        return "<unknown>"
-            else:
-                return value
-
-        def interpret_blobs(row):
-            summary_types = self._db.conn.execute(
-                "SELECT name, summary_type FROM run_variables WHERE proposal=? AND run=? AND summary_type IS NOT NULL",
-                (row["proposal"], row["run"])).fetchall()
-            summary_types = { row[0]: row[1] for row in summary_types }
-
-            for col in row.keys():
-                row[col] = blob2type(row[col], summary_types.get(col))
-            return row
-
-        df = df.apply(interpret_blobs, axis=1)
-
-        # Use the full variable titles
         if with_titles:
-            results = self._db.conn.execute("SELECT name, title FROM variables").fetchall()
-            renames = { row[0]: row[1] for row in results }
+            renames = dict(self._db.variable_titles())
             renames["proposal"] = "Proposal"
             renames["run"] = "Run"
             renames["start_time"] = "Timestamp"
-
             df.rename(columns=renames, inplace=True)
 
         return df

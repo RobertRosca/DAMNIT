@@ -22,11 +22,14 @@ dependencies = [
     "orjson",  # used in plotly for faster json serialization
     "pandas >=2.1.0",
     "plotly",
+    "psycopg[binary]>=3.2",
+    "SQLAlchemy>=2.0,<3",
     "xarray"
 ]
 
 [project.optional-dependencies]
 backend = [
+    "alembic>=1.13",
     "EXtra-data",
     "EXtra-proposal",
     "ipython",
@@ -57,6 +60,7 @@ gui = [
 test = [
     "pillow",
     "pytest",
+    "pytest-postgresql>=6",
     "pytest-qt",
     "pytest-cov",
     "pytest-xvfb",
@@ -82,9 +86,6 @@ damnit = "damnit.cli:main"
 [tool.pytest.ini_options]
 timeout = 120
 norecursedirs = "tests/helpers"
-filterwarnings = [
-    "ignore:unclosed database in <sqlite3:ResourceWarning",
-]
 
 [tool.pixi.workspace]
 channels = ["conda-forge"]
@@ -99,6 +100,9 @@ docs = { features = ["docs"], solve-group = "default" }
 test = { features = ["test", "backend", "gui"], solve-group = "default" }
 
 [tool.pixi.tasks]
+
+[tool.pixi.feature.test.dependencies]
+postgresql = "*"
 
 [tool.pixi.feature.test.tasks]
 test = "python -m pytest -v --cov=damnit --cov-report=xml"

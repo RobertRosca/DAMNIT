@@ -3,24 +3,26 @@ import json
 import logging
 import os
 import platform
-import sqlite3
-import time
 from dataclasses import dataclass
 from pathlib import Path
 from socket import gethostname
 from threading import Thread
 
 from kafka import KafkaConsumer
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from ..api import find_proposal
 from ..context import RunData
 from ..definitions import DEFAULT_DAMNIT_PYTHON
-from ..api import find_proposal
-from .db import DamnitDB, KeyValueMapping, db_path
+from .db import DamnitDB, get_sessionmaker
+from .db.models import ListenerProposal, ListenerSetting
 from .extraction_control import ExtractionRequest, ExtractionSubmitter
 from .service import notify_ready
 
-# For now, the migration & calibration events come via DESY's Kafka brokers,
-# but the DAMNIT updates go via XFEL's test instance.
+# Migration & calibration events come via DESY's Kafka brokers. DAMNIT
+# uses Postgres LISTEN/NOTIFY internally, but consuming DESY events still
+# requires a Kafka consumer.
 CONSUMER_ID = 'xfel-da-damnit-{}'
 KAFKA_CONF = {
     'maxwell': {
@@ -34,20 +36,11 @@ KAFKA_CONF = {
         'events': ['daq_run_complete', 'online_correction_complete'],
     }
 }
-READONLY_WAIT_REOPEN = 2  # Wait N seconds to reopen after read-only error
-
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS proposal_databases(proposal, db_dir UNIQUE, official);
-CREATE INDEX IF NOT EXISTS proposals ON proposal_databases (proposal);
-
--- Settings for the listener
-CREATE TABLE IF NOT EXISTS settings(key PRIMARY KEY NOT NULL, value)
-"""
 
 log = logging.getLogger(__name__)
 
-# tracking number of local threads running in parallel
-# only relevant if slurm isn't available
+# Tracking number of local threads running in parallel; only relevant if
+# slurm isn't available.
 MAX_CONCURRENT_THREADS = min(os.cpu_count() // 2, 10)
 local_extraction_threads = []
 
@@ -67,7 +60,7 @@ def execute_direct(submitter, request):
         log.warning(f'Too many events processing ({MAX_CONCURRENT_THREADS}), '
                     f'skip event (p{request.proposal}, r{request.run}, {request.run_data.value})')
         return
-    
+
     def _run():
         try:
             submitter.execute_direct(request)
@@ -80,15 +73,16 @@ def execute_direct(submitter, request):
 
 
 class ListenerDB:
-    def __init__(self, db_dir):
-        self.conn = sqlite3.connect(db_dir.absolute() / "listener.sqlite")
-        self.conn.executescript(SCHEMA)
-        self._settings = KeyValueMapping(self.conn, "settings")
+    """Listener state (subscribed proposals + settings) stored in Postgres."""
 
-        # To help prevent accidentally starting multiple listeners we default to
-        # putting it in static mode.
-        self.settings.setdefault("static_mode", True)
-        self.settings.setdefault("allow_local_processing", False)
+    def __init__(self, db_dir: Path = None):
+        # ``db_dir`` is kept in the signature for CLI compatibility but is
+        # no longer used; state lives in the shared Postgres database.
+        self._sm = get_sessionmaker()
+        self._session = self._sm()
+        # Seed defaults so the setter never races with first-time lookups.
+        self.settings.setdefault("static_mode", "true")
+        self.settings.setdefault("allow_local_processing", "false")
 
     def __enter__(self):
         return self
@@ -97,35 +91,131 @@ class ListenerDB:
         self.close()
 
     def close(self):
-        self.conn.close()
+        self._session.close()
 
     @property
-    def settings(self):
-        return self._settings
+    def settings(self) -> "ListenerSettings":
+        return ListenerSettings(self._session)
 
-    def all_proposals(self):
-        rows = self.conn.execute("SELECT proposal, db_dir, official FROM proposal_databases").fetchall()
-        result = { }
+    def all_proposals(self) -> dict[int, list[ProposalDBInfo]]:
+        rows = self._session.execute(
+            select(ListenerProposal.proposal, ListenerProposal.db_dir,
+                   ListenerProposal.official)
+        ).all()
+        result: dict[int, list[ProposalDBInfo]] = {}
         for proposal, db_dir, official in rows:
-            if proposal not in result:
-                result[proposal] = []
-            result[proposal].append(ProposalDBInfo(Path(db_dir), bool(official)))
+            result.setdefault(proposal, []).append(
+                ProposalDBInfo(Path(db_dir), bool(official))
+            )
         return result
 
-    def proposal_db_dirs(self, proposal: int):
-        rows = self.conn.execute("SELECT db_dir from proposal_databases WHERE proposal=?",
-                                 (proposal,)).fetchall()
-        return [Path(row[0]) for row in rows]
+    def proposal_db_dirs(self, proposal: int) -> list[Path]:
+        stmt = (
+            select(ListenerProposal.db_dir)
+            .where(ListenerProposal.proposal == proposal)
+        )
+        return [Path(row[0]) for row in self._session.execute(stmt)]
 
-    def add_proposal_db(self, proposal: int, db_dir, official: bool):
-        with self.conn:
-            self.conn.execute("""
-                INSERT INTO proposal_databases (proposal, db_dir, official) VALUES (?, ?, ?)
-            """, (proposal, str(db_dir), official))
+    def add_proposal_db(self, proposal: int, db_dir, official: bool) -> None:
+        stmt = pg_insert(ListenerProposal.__table__).values(
+            proposal=int(proposal), db_dir=str(db_dir), official=bool(official),
+        ).on_conflict_do_update(
+            index_elements=["proposal"],
+            set_={"db_dir": str(db_dir), "official": bool(official)},
+        )
+        self._session.execute(stmt)
+        self._session.commit()
 
-    def remove_proposal_db(self, db_dir):
-        with self.conn:
-            self.conn.execute("DELETE FROM proposal_databases WHERE db_dir=?", (str(db_dir),))
+    def remove_proposal_db(self, db_dir) -> None:
+        self._session.execute(
+            ListenerProposal.__table__.delete()
+            .where(ListenerProposal.db_dir == str(db_dir))
+        )
+        self._session.commit()
+
+
+class ListenerSettings:
+    """MutableMapping-ish helper backed by the listener_settings table."""
+
+    _BOOL_KEYS = {"static_mode", "allow_local_processing"}
+
+    def __init__(self, session):
+        self._s = session
+
+    def _normalise(self, key: str, value):
+        if value is None:
+            return None
+        if key in self._BOOL_KEYS:
+            if isinstance(value, bool):
+                return "true" if value else "false"
+            return str(value).lower()
+        return str(value)
+
+    def _cast(self, key: str, value):
+        if value is None:
+            return None
+        if key in self._BOOL_KEYS:
+            return value.lower() in ("1", "true", "yes", "on")
+        return value
+
+    def __getitem__(self, key):
+        row = self._s.get(ListenerSetting, key)
+        if row is None:
+            raise KeyError(key)
+        return self._cast(key, row.value)
+
+    def __setitem__(self, key, value):
+        stmt = pg_insert(ListenerSetting.__table__).values(
+            key=key, value=self._normalise(key, value),
+        ).on_conflict_do_update(
+            index_elements=["key"],
+            set_={"value": self._normalise(key, value)},
+        )
+        self._s.execute(stmt)
+        self._s.commit()
+
+    def __delitem__(self, key):
+        self._s.execute(
+            ListenerSetting.__table__.delete()
+            .where(ListenerSetting.key == key)
+        )
+        self._s.commit()
+
+    def __iter__(self):
+        return iter(
+            row[0] for row in self._s.execute(select(ListenerSetting.key))
+        )
+
+    def __len__(self):
+        from sqlalchemy import func
+        return int(self._s.scalar(
+            select(func.count()).select_from(ListenerSetting)
+        ) or 0)
+
+    def __contains__(self, key):
+        try:
+            self[key]
+            return True
+        except KeyError:
+            return False
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            return default
+
+    def setdefault(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            self[key] = default
+            return self._cast(key, self._normalise(key, default))
+
+    def items(self):
+        stmt = select(ListenerSetting.key, ListenerSetting.value)
+        return [(k, self._cast(k, v)) for k, v in self._s.execute(stmt)]
+
 
 class EventProcessor:
     def __init__(self, listener_dir: Path):
@@ -134,7 +224,6 @@ class EventProcessor:
 
         hostname = gethostname()
         if hostname.startswith('exflonc'):
-            # running on the online cluster
             kafka_conf = KAFKA_CONF['onc']
         else:
             kafka_conf = KAFKA_CONF['maxwell']
@@ -155,6 +244,7 @@ class EventProcessor:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.kafka_cns.close()
+        self.db.close()
         return False
 
     def run(self):
@@ -162,15 +252,6 @@ class EventProcessor:
             for record in self.kafka_cns:
                 try:
                     self._process_kafka_event(record)
-                except sqlite3.OperationalError as e:
-                    if e.sqlite_errorcode == sqlite3.SQLITE_READONLY:
-                        log.error("SQLite database is read only. Pause, reopen, retry.")
-                        self.db.close()
-                        time.sleep(READONLY_WAIT_REOPEN)
-                        self.db = ListenerDB(self._listener_dir)
-                        self._process_kafka_event(record)
-                    else:
-                        log.error("Unexpected error handling Kafka event.", exc_info=True)
                 except Exception:
                     log.error("Unexpected error handling Kafka event.", exc_info=True)
 
@@ -199,47 +280,48 @@ class EventProcessor:
         proposal = int(msg['proposal'])
         run = int(msg['run'])
 
-        # If it's the first time we've seen this proposal and we're not in
-        # static mode, add it to the database.
         try:
             official_path = find_proposal(proposal) / "usr/Shared/amore"
         except FileNotFoundError:
             log.warning(f"Could not find proposal directory for p{proposal}")
             official_path = None
 
-        if official_path and db_path(official_path).is_file() and not self.db.settings["static_mode"]:
-            if official_path not in self.db.proposal_db_dirs(proposal):
-                self.db.add_proposal_db(proposal, official_path, True)
+        static_mode = self.db.settings.get("static_mode", True)
+        if (official_path and not static_mode
+                and official_path not in self.db.proposal_db_dirs(proposal)):
+            self.db.add_proposal_db(proposal, official_path, True)
 
-        sandbox_args = self.db.settings.get("sandbox_args", "")
-        allow_local_processing = self.db.settings["allow_local_processing"]
+        sandbox_args = self.db.settings.get("sandbox_args", "") or ""
+        allow_local_processing = bool(self.db.settings.get("allow_local_processing", False))
         for path in self.db.proposal_db_dirs(proposal):
             try:
-                with DamnitDB.from_dir(path) as db:
-                    # Fail fast if read-only - https://stackoverflow.com/a/44707371/434217
-                    db.conn.execute("pragma user_version=0;")
-
+                with DamnitDB(proposal=proposal) as db:
                     db.ensure_run(proposal, run, record.timestamp / 1000)
-                    log.info(f"Added p%d r%d ({run_data.value} data) to database", proposal, run)
+                    log.info(f"Added p%d r%d ({run_data.value} data) to database",
+                             proposal, run)
 
-                    # Set the default to the stable DAMNIT module if not already set
-                    damnit_python = db.metameta.setdefault("damnit_python", DEFAULT_DAMNIT_PYTHON)
-                    submitter = ExtractionSubmitter(db.path.parent, db)
-                    req = ExtractionRequest(run, proposal, run_data, sandbox_args, damnit_python)
+                    damnit_python = db.get_setting("damnit_python") or DEFAULT_DAMNIT_PYTHON
+                    if db.get_setting("damnit_python") is None:
+                        db.set_setting("damnit_python", damnit_python)
+                    submitter = ExtractionSubmitter(path, db)
+                    req = ExtractionRequest(run, proposal, run_data,
+                                            sandbox_args, damnit_python)
 
                 try:
                     submitter.submit(req)
                 except Exception as e:
                     if allow_local_processing:
-                        log.error("Slurm job submission failed, starting process locally.", exc_info=True)
+                        log.error("Slurm job submission failed, starting process locally.",
+                                  exc_info=True)
                         execute_direct(submitter, req)
                     else:
                         raise e
             except Exception:
-                log.error(f"Processing p{proposal}, r{run} for {path} failed:", exc_info=True)
+                log.error(f"Processing p{proposal}, r{run} for {path} failed:",
+                          exc_info=True)
+
 
 def listen(db_dir):
-    # Set up logging to a file
     file_handler = logging.FileHandler("damnit.log")
     formatter = logging.root.handlers[0].formatter
     file_handler.setFormatter(formatter)
@@ -255,8 +337,8 @@ def listen(db_dir):
     except Exception:
         log.error("Stopping on unexpected error", exc_info=True)
 
-    # Flush all logs
     logging.shutdown()
 
+
 if __name__ == '__main__':
-    listen()
+    listen(Path.cwd())

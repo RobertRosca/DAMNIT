@@ -22,7 +22,7 @@ def test_damnit(mock_db_with_data):
     # Smoke test
     assert str(damnit.proposal) in repr(damnit)
 
-    assert damnit.proposal == db.metameta["proposal"]
+    assert damnit.proposal == db.proposal
     assert damnit.runs() == [1]
 
     # Test indexing
@@ -50,7 +50,7 @@ def test_run_variables(mock_db_with_data, monkeypatch):
     rv = damnit[1]
 
     # Test properties
-    assert rv.proposal == db.metameta["proposal"]
+    assert rv.proposal == db.proposal
     assert rv.run == 1
 
     # Test getting keys and titles
@@ -179,9 +179,7 @@ def test_variable_data(mock_db_with_data, monkeypatch):
     line_summary = rv["line"].summary()
     assert isinstance(line_summary, np.ndarray)
     assert line_summary.shape[0] == 2
-    summary_type = db.conn.execute(
-        "SELECT summary_type FROM run_variables WHERE name='line' AND run=1"
-    ).fetchone()[0]
+    _val, summary_type, _attrs = db.get_variable(db.proposal, 1, "line")
     assert summary_type == "trendline"
 
 

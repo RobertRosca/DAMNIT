@@ -819,7 +819,7 @@ def test_trendline_summary_to_db(mock_run, mock_db, tmp_path):
 def test_extractor(mock_ctx, mock_db, mock_run, monkeypatch):
     # Change to the DB directory
     db_dir, db = mock_db
-    db.metameta["proposal"] = 1234
+    # proposal is set via DamnitDB(proposal=1234)
     monkeypatch.chdir(db_dir)
     pkg = "damnit.backend.extract_data"
 
@@ -954,7 +954,7 @@ def test_custom_environment(mock_db, venv, monkeypatch, qtbot):
         Extractor()
 
     # Set the context_python field in the database
-    db.metameta["context_python"] = str(venv.python)
+    db.set_setting("context_python", str(venv.python))
 
     with patch(f"{pkg}.KafkaProducer"):
         RunExtractor(1234, 42, mock=True).extract_and_ingest()
@@ -979,12 +979,9 @@ def test_initialize_proposal(tmp_path):
     # And be writable by everyone
     assert path_filemode(db_dir) == "drwxrwxrwx"
 
-    # Check that the database was initialized correctly
-    db_path = db_dir / "runs.sqlite"
-    assert db_path.is_file()
-    assert path_filemode(db_path) == good_file_mode
-    db = DamnitDB(db_path)
-    assert db.metameta["proposal"] == 1234
+    # Check that the proposal was initialized correctly
+    db = DamnitDB(proposal=1234)
+    assert db.proposal == 1234
 
     # Check the context file
     context_path = db_dir / "context.py"
@@ -1127,9 +1124,8 @@ def test_copy_ctx_and_user_vars(tmp_path, mock_db, mock_user_vars):
     assert ctx_file.is_file()
     assert ctx_file.read_text() == (prev_db_dir / "context.py").read_text()
 
-    db_file = db_dir / "runs.sqlite"
-    assert db_file.is_file()
-    assert set(DamnitDB(db_file).get_user_variables()) == set(mock_user_vars)
+    # User variables should have been copied into the new proposal.
+    assert set(DamnitDB(proposal=1234).get_user_variables()) == set(mock_user_vars)
 
 
 def test_listener(tmp_path, caplog, monkeypatch):
@@ -1149,8 +1145,8 @@ def test_listener(tmp_path, caplog, monkeypatch):
     proposal_dir.mkdir(parents=True)
     db_dir = proposal_dir / "usr/Shared/amore"
     initialize_proposal(db_dir, 1234)
-    db = DamnitDB.from_dir(db_dir)
-    db.metameta["context_python"] = sys.executable
+    db = DamnitDB(proposal=1234)
+    db.set_setting("context_python", sys.executable)
 
     # First event: static_mode == True -> ignore event
     event = MagicMock(timestamp=time())
@@ -1168,8 +1164,8 @@ def test_listener(tmp_path, caplog, monkeypatch):
     # Add an unofficial DB so that the listener launches two Slurm jobs
     fake_db_dir = tmp_path / "fakedb"
     initialize_proposal(fake_db_dir, 1234)
-    fake_db = DamnitDB.from_dir(fake_db_dir)
-    fake_db.metameta["context_python"] = sys.executable
+    fake_db = DamnitDB(proposal=1234)
+    fake_db.set_setting("context_python", sys.executable)
     processor.db.add_proposal_db(1234, fake_db_dir, False)
 
     with patch("damnit.backend.extraction_control.ExtractionSubmitter.submit",
@@ -1208,8 +1204,8 @@ def test_listener_local(tmp_path, caplog, monkeypatch):
     proposal_dir.mkdir(parents=True)
     db_dir = proposal_dir / "usr/Shared/amore"
     initialize_proposal(db_dir, 1234)
-    db = DamnitDB.from_dir(db_dir)
-    db.metameta["context_python"] = sys.executable
+    db = DamnitDB(proposal=1234)
+    db.set_setting("context_python", sys.executable)
 
     # Disable static mode so the proposal DB is tracked
     processor.db.settings["static_mode"] = False
@@ -1248,8 +1244,8 @@ def test_listener_local(tmp_path, caplog, monkeypatch):
         # Add an unofficial DB so that the listener launches two local jobs
         fake_db_dir = tmp_path / "fakedb"
         initialize_proposal(fake_db_dir, 1234)
-        fake_db = DamnitDB.from_dir(fake_db_dir)
-        fake_db.metameta["context_python"] = sys.executable
+        fake_db = DamnitDB(proposal=1234)
+        fake_db.set_setting("context_python", sys.executable)
         processor.db.add_proposal_db(1234, fake_db_dir, False)
 
         caplog.clear()
@@ -1312,8 +1308,8 @@ def test_extract_data_sandbox(mock_db, tmp_path, monkeypatch):
     """
     db_dir, db = mock_db
     # Ensure context loads using an available interpreter
-    db.metameta["context_python"] = sys.executable
-    db.metameta["proposal"] = 1234
+    db.set_setting("context_python", sys.executable)
+    # proposal is set via DamnitDB(proposal=1234)
     monkeypatch.chdir(db_dir)
 
     # Create a logging + forwarding sandbox script

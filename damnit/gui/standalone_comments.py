@@ -20,11 +20,7 @@ class CommentModel(QAbstractTableModel):
 
     def load_comments(self):
         """Load comments from the database, sorted by timestamp in descending order"""
-        self._data = self.db.conn.execute("""
-            SELECT rowid, timestamp, comment FROM time_comments
-            ORDER BY timestamp DESC
-        """).fetchall()
-
+        self._data = list(self.db.list_standalone_comments())
         self.layoutChanged.emit()
 
     def data(self, index, role=Qt.DisplayRole):
